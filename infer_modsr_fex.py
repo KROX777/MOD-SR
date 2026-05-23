@@ -1,0 +1,709 @@
+import torch
+import logging
+import csv
+import os
+import copy
+import numpy as np
+import sympy as sp
+from tqdm import tqdm
+from parsers import get_parser
+from symbolicregression.envs import build_env
+from symbolicregression.model.modsr_model import MODSRModel
+from symbolicregression.envs.fixed_tree_encoder import FixedTreeEncoder
+from generate_test_cases import generate_test_cases
+from tools.const_opt import refine
+from symbolicregression.metrics import compute_metrics
+from symbolicregression.utils import process_benchmark_string, load_benchmark_test_cases, get_model
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+def _strip_bos_eos(seq_ids, eos_id):
+    seq = list(seq_ids)
+    if eos_id is not None and len(seq) > 0 and seq[0] == eos_id:
+        seq = seq[1:]
+    if eos_id is not None and len(seq) > 0 and seq[-1] == eos_id:
+        seq = seq[:-1]
+    return seq
+
+def decode_token_sequence(env, token_tensor):
+    """
+    Decode token tensor to a generator tree, handling both standard and FEX encodings.
+    """
+    seq_ids = token_tensor.cpu().tolist()
+    eos_id = env.equation_word2id.get("<EOS>", None)
+    pad_id = env.equation_word2id.get("<PAD>", None)
+
+    if getattr(env, "fex_encoder", None) is not None:
+        trimmed = _strip_bos_eos(seq_ids, eos_id)
+        try:
+            decoded_sympy = env.fex_encoder.decode(trimmed)
+            if decoded_sympy is None:
+                raise ValueError("FEX decode returned None")
+            tree = env.simplifier.sympy_expr_to_tree(decoded_sympy)
+            return tree
+        except Exception as decode_err:
+            words = [env.equation_id2word.get(t, "<UNK>") for t in trimmed]
+            logger.warning(f"FEX decode failed: {decode_err}; tokens={words}")
+            return None
+
+    valid_ids = [tid for tid in seq_ids if pad_id is None or tid != pad_id]
+    valid_ids = _strip_bos_eos(valid_ids, eos_id)
+    if len(valid_ids) == 0:
+        return None
+    try:
+        tree = env.idx_to_infix(valid_ids, is_float=False, str_array=False)
+    except Exception:
+        eq_str = [env.equation_id2word.get(int(t), "<UNK>") for t in valid_ids]
+        tree = env.equation_encoder.decode(eq_str)
+    return tree
+
+def decode_fex_tokens(env, token_tensor):
+    seq_ids = token_tensor.cpu().tolist()
+    eos_id = env.equation_word2id.get("<EOS>", None)
+    trimmed = _strip_bos_eos(seq_ids, eos_id)
+    try:
+        decoded_sympy = env.fex_encoder.decode(trimmed)
+        if decoded_sympy is None:
+            return None
+        return env.simplifier.sympy_expr_to_tree(decoded_sympy)
+    except Exception:
+        return None
+
+def apply_constraints(tokens, logits, env, batch_size=5):
+    """
+    Apply constraints to FEX tokens (CPU-only, batched to avoid OOM).
+    """
+    if env is None:
+        return tokens
+        
+    decoder_constraints = env.get_decoder_constraints()
+    if decoder_constraints is None:
+        return tokens
+    
+    device = tokens.device
+    pos_types, allowed_mask = decoder_constraints
+    pos_types = pos_types.cpu()
+    allowed_mask = allowed_mask.cpu()
+    
+    constraints = env.get_fex_leaf_constraints()
+    leaf_pairs = constraints.get('leaf_pairs', []) if constraints else []
+    vocab_size = logits.size(-1)
+    seq_len = min(logits.size(1), len(pos_types))
+    min_val = torch.finfo(logits.dtype).min
+    pad_id = env.equation_word2id.get('<PAD>')
+    
+    # Pre-create masks on CPU
+    mantissa_mask = torch.zeros(vocab_size, dtype=torch.bool)
+    sign_mask = torch.zeros(vocab_size, dtype=torch.bool)
+    if constraints:
+        mantissa_mask[constraints['mantissa_ids']] = True
+        sign_mask[constraints['sign_ids']] = True
+    exp_ids = torch.tensor(constraints['exponent_ids']) if constraints else torch.tensor([])
+    var_ids = torch.tensor(constraints['variable_ids']) if constraints else torch.tensor([])
+    
+    # Process in batches to avoid NPU memory spike
+    adjusted_list = []
+    total = tokens.size(0)
+    
+    for start in range(0, total, batch_size):
+        end = min(start + batch_size, total)
+        # Move batch to CPU, process, immediately move back
+        tok_batch = tokens[start:end].cpu()
+        log_batch = logits[start:end].cpu()
+        
+        # Position constraints
+        valid_mask = allowed_mask[pos_types[:seq_len]]
+        curr_logits = log_batch[:, :seq_len, :].clone()
+        curr_logits[~valid_mask.unsqueeze(0).expand(curr_logits.size(0), -1, -1)] = min_val
+        tok_batch[:, :seq_len] = curr_logits.argmax(dim=-1)
+        
+        # Leaf pair constraints
+        for pos1_idx, pos2_idx in leaf_pairs:
+            if pos1_idx >= seq_len or pos2_idx >= seq_len:
+                continue
+            pos2_tok = tok_batch[:, pos2_idx]
+            
+            is_exp = torch.isin(pos2_tok, exp_ids) if len(exp_ids) > 0 else torch.zeros_like(pos2_tok, dtype=torch.bool)
+            if is_exp.any():
+                l = log_batch[:, pos1_idx, :].clone()
+                l[:, ~mantissa_mask] = min_val
+                tok_batch[is_exp, pos1_idx] = l.argmax(dim=-1)[is_exp]
+            
+            is_var = torch.isin(pos2_tok, var_ids) if len(var_ids) > 0 else torch.zeros_like(pos2_tok, dtype=torch.bool)
+            if is_var.any():
+                l = log_batch[:, pos1_idx, :].clone()
+                l[:, ~sign_mask] = min_val
+                tok_batch[is_var, pos1_idx] = l.argmax(dim=-1)[is_var]
+            
+            if pad_id is not None:
+                is_pad = (pos2_tok == pad_id)
+                if is_pad.any():
+                    tok_batch[is_pad, pos1_idx] = pad_id
+        
+        adjusted_list.append(tok_batch.to(device))
+        # Explicit cleanup
+        del tok_batch, log_batch, curr_logits
+        if hasattr(torch, 'npu') and 'npu' in str(device):
+            torch.npu.empty_cache()
+    
+    return torch.cat(adjusted_list, dim=0)
+
+def perturb_optimize_with_guidance(
+    model,
+    env,
+    samples,
+    params,
+    rewrite_steps=3,
+    rewrite_ratio=0.25,
+    num_candidates=1,
+):
+    """
+    Simplified T2T: perturb + 2-step guidance reconstruction.
+    """
+    raw_model = get_model(model)
+    device = params.device if hasattr(params, 'device') else raw_model.device
+
+    logger.info(f"T2T: {rewrite_steps} steps, ratio={rewrite_ratio}, candidates={num_candidates}")
+
+    x_series = samples.get('x_to_fit', [])
+    y_series = samples.get('y_to_fit', [])
+    if len(x_series) == 0 or len(y_series) == 0:
+        raise ValueError("T2T requires x_to_fit and y_to_fit.")
+
+    # Initial sampling
+    with torch.no_grad():
+        current_tokens, current_logits = raw_model.sample(
+            samples, num_samples=num_candidates, use_ddim=True, ddim_steps=50, use_fex_head=True
+        )
+
+    total_timesteps = raw_model.scheduler.num_timesteps
+    perturb_timesteps = max(1, int(total_timesteps * rewrite_ratio))
+    
+    # T2T time window: [0, rewrite_ratio] (normalized), force 2 guidance steps
+    original_t_min = getattr(raw_model, 'guidance_t_min', 0.3)
+    original_t_max = getattr(raw_model, 'guidance_t_max', 0.7)
+    original_max_steps = getattr(raw_model, 'guidance_max_steps', 5)
+
+    # T2T loop: perturb + guided reconstruction
+    for rewrite_iter in range(rewrite_steps):
+        # 1. Perturbation
+        with torch.no_grad():
+            embeds = raw_model.generator.token_embedding(current_tokens)
+            t_perturb = torch.full((num_candidates,), perturb_timesteps, device=device, dtype=torch.long)
+            x_t_perturbed, _ = raw_model.scheduler.q_sample(embeds, t_perturb)
+
+        # 2. Guided reconstruction: adjust scheduler to T2T time window, exactly 2 steps
+        raw_model.guidance_t_min = 0.0  # Start from timestep 0
+        raw_model.guidance_t_max = rewrite_ratio  # Up to perturbation level
+        raw_model.guidance_max_steps = 2  # Exactly 2 guidance steps
+        
+        try:
+            with torch.no_grad():
+                current_tokens, current_logits = raw_model.sample_with_guidance(
+                    samples,
+                    num_samples=num_candidates,
+                    use_ddim=True,
+                    ddim_steps=50,
+                    guidance_scale=params.guidance_scale,
+                    guidance_temperature=params.guidance_temperature,
+                    fex_env=env,
+                    guidance_objective=params.guidance_objective,
+                    guidance_length_window=params.guidance_length_window,
+                    guidance_length_min_active=params.guidance_length_min_active,
+                    x_t_perturbed=x_t_perturbed,
+                    start_timestep=perturb_timesteps,
+                )
+        finally:
+            # Restore original scheduler settings
+            raw_model.guidance_t_min = original_t_min
+            raw_model.guidance_t_max = original_t_max
+            raw_model.guidance_max_steps = original_max_steps
+
+    return current_tokens, current_logits, []
+
+
+def test_modsr(model, env, params, test_cases=None, num_samples=50, top_k=20, seed=42, fex_encoder=None, env_fex=None, return_results=False):
+    """
+    Test MODSR model.
+    
+    Args:
+        return_results: If True, return the list of R2 results instead of printing summary
+    """
+    if test_cases is None:
+        logger.info(f"Generating {num_samples} test cases with seed={seed}...")
+        test_cases = generate_test_cases(n_tests=num_samples, seed=seed, max_input_dimension=params.max_test_input_dimension, params=params)
+    
+    if len(test_cases) == 0:
+        logger.warning("No test cases generated/loaded!")
+        return [] if return_results else None
+
+    logger.info(f"Running inference on {len(test_cases)} test cases...")
+    
+    model.eval()
+    raw_model = get_model(model)
+    device = params.device if hasattr(params, 'device') else raw_model.device
+    
+    results = []
+    
+    # Check if this is Panczyk-KAN dataset
+    is_panczyk = len(test_cases) > 0 and test_cases[0].get('dataset') in ['bwr', 'chf', 'htgr', 'mitr', 'xs', 'heat']
+
+    with torch.no_grad():
+        for i, test_case in enumerate(tqdm(test_cases, desc="Inference")):
+            gt_expr = test_case.get('gt_expr')
+            dataset_name = test_case.get('dataset', 'unknown')
+            test_name = test_case.get('name', f"Test {i}")
+            
+            print(f"\n{'='*50}")
+            if is_panczyk:
+                n_samples = test_case.get('n_samples', 'unknown')
+                n_features = test_case.get('n_features', 'unknown')
+                print(f"Dataset: {dataset_name.upper()} ({n_samples} samples, {n_features} features)")
+            else:
+                print(f"GT: {gt_expr}")
+
+            try:
+                x_grid = test_case['x_grid']
+                y_vals = test_case['y_vals']
+                
+                # Ensure y_vals is 2D (n_points, 1) to match traditional benchmark format
+                if y_vals.ndim == 1:
+                    y_vals = y_vals.reshape(-1, 1)
+                
+                # Use the dataset directly (same format as traditional benchmark)
+                samples = {
+                    'x_to_fit': [torch.from_numpy(x_grid).float().to(device)],
+                    'y_to_fit': [torch.from_numpy(y_vals).float().to(device)],
+                    'gt_expr': [gt_expr],
+                }
+                
+                # (1) Direct embedding -> FEX head                
+                if getattr(params, "use_perturb_optimization", False):
+                    logger.info(f"Using Perturb Optimization (rewrite_steps={params.perturb_rewrite_steps}, ratio={params.perturb_rewrite_ratio})")
+                    if env_fex is None or getattr(env_fex, "fex_encoder", None) is None:
+                        raise ValueError("Perturb optimization requires a FEX-enabled environment (env_fex).")
+                    direct_tokens, direct_logits, perturb_history = perturb_optimize_with_guidance(
+                        model,
+                        env_fex,
+                        samples,
+                        params,
+                        rewrite_steps=params.perturb_rewrite_steps,
+                        rewrite_ratio=params.perturb_rewrite_ratio,
+                        num_candidates=top_k,
+                    )
+                    valid_scores = [h['score'] for h in perturb_history if h['score'] is not None]
+                    if valid_scores:
+                        logger.info(f"Perturb optimization completed! Best R^2 found: {max(valid_scores):.6f}")
+
+                elif getattr(params, "use_gradient_guidance", False):
+                    if env_fex is None or getattr(env_fex, "fex_encoder", None) is None:
+                        raise ValueError("Gradient guidance requires a FEX-enabled environment (env_fex).")
+                    logger.info(f"Using Gradient Guidance (scale={params.guidance_scale}) with FEX Head.")
+                    direct_tokens, direct_logits = raw_model.sample_with_guidance(
+                        samples,
+                        num_samples=top_k,
+                        use_ddim=True,
+                        ddim_steps=50,
+                        guidance_scale=params.guidance_scale,
+                        guidance_temperature=params.guidance_temperature,
+                        fex_env=env_fex,
+                        guidance_objective=params.guidance_objective,
+                        guidance_length_window=params.guidance_length_window,
+                        guidance_length_min_active=params.guidance_length_min_active,
+                    )
+                else:
+                    direct_tokens, direct_logits = raw_model.sample(
+                        samples,
+                        num_samples=top_k,
+                        use_ddim=True,
+                        ddim_steps=50,
+                        use_fex_head=True
+                    )
+                    
+                direct_tokens = apply_constraints(direct_tokens, direct_logits, env_fex)
+                # print("Direct embedding -> FEX head expressions (top 3):")
+                # for k in range(min(top_k, 3)):
+                #     tree = decode_fex_tokens(env_fex, direct_tokens[k])
+                #     print(f"  Sample {k}: {tree}")
+                
+                candidates = []
+                eos_id = env_fex.equation_word2id.get("<EOS>", None)
+                for k in range(top_k):
+                    raw_ids = direct_tokens[k].cpu().tolist()
+                    trimmed = _strip_bos_eos(raw_ids, eos_id)
+                    try:
+                        decoded_sympy = env_fex.fex_encoder.decode(trimmed)
+                        if decoded_sympy is None:
+                            raise ValueError("FEX decode returned None")
+                        tree = env_fex.simplifier.sympy_expr_to_tree(decoded_sympy)
+                    except Exception as decode_err:
+                        raw_tokens = [env_fex.equation_id2word.get(t, '<UNK>') for t in trimmed]
+                        print(f"FEX decode failed: {decode_err}; tokens={raw_tokens}")
+                        tree = None
+                    if tree is not None:
+                        candidates.append(tree)
+                
+                if len(candidates) == 0:
+                    print("No valid candidates generated.")
+                    continue
+                
+                y_vals_refine = y_vals.reshape(-1, 1) if y_vals.ndim == 1 else y_vals
+                
+                # Adaptive batch refine: try larger batches first, degrade on OOM
+                refined_candidates = []
+                # Dynamic batch sizes: try 20 first, then degrade to 10, 5, 1
+                batch_sizes = [20, 10, 5, 1]
+                current_batch_idx = 0
+                
+                batch_start = 0
+                while batch_start < len(candidates) and len(refined_candidates) < 10:
+                    batch_size = batch_sizes[current_batch_idx]
+                    batch_end = min(batch_start + batch_size, len(candidates))
+                    batch_candidates = candidates[batch_start:batch_end]
+                    
+                    try:
+                        batch_refined = refine(
+                            env=env_fex,
+                            X=x_grid,
+                            y=y_vals_refine,
+                            candidates=batch_candidates,
+                            verbose=False
+                        )
+                        
+                        if isinstance(batch_refined, list):
+                            for res in batch_refined:
+                                if isinstance(res, dict) and 'predicted_tree' in res:
+                                    refined_candidates.append(res)
+                        
+                        # Success! Move to next batch with current batch size
+                        batch_start = batch_end
+                        
+                        # Clean up after successful batch
+                        if hasattr(torch, 'npu') and 'npu' in str(device):
+                            torch.npu.empty_cache()
+                            
+                    except RuntimeError as e:
+                        if 'out of memory' in str(e).lower() or '507015' in str(e):
+                            # OOM error, degrade to smaller batch size
+                            current_batch_idx += 1
+                            if current_batch_idx >= len(batch_sizes):
+                                # Already at smallest batch size, skip this candidate
+                                logger.warning(f"OOM even with batch_size=1, skipping candidates {batch_start}-{batch_end}")
+                                batch_start = batch_end
+                                current_batch_idx = len(batch_sizes) - 1  # Keep at 1
+                            else:
+                                new_size = batch_sizes[current_batch_idx]
+                                logger.info(f"OOM detected, degrading batch size to {new_size}")
+                        else:
+                            # Other error, skip this batch
+                            logger.warning(f"Refine batch {batch_start}-{batch_end} failed: {e}")
+                            batch_start = batch_end
+                    except Exception as e:
+                        logger.warning(f"Refine batch {batch_start}-{batch_end} failed: {e}")
+                        batch_start = batch_end
+
+                if len(refined_candidates) > 0:
+                    best_candidate = refined_candidates[0]
+                    best_tree = best_candidate.get('predicted_tree')
+                    
+                    if best_tree is None:
+                        print("Best tree is None")
+                        continue
+
+                    print(f"Pred (refined): {best_tree}")
+                    
+                    numexpr_fn = env_fex.simplifier.tree_to_numexpr_fn(best_tree)
+                    y_pred = numexpr_fn(x_grid)
+                    # Handle both 1D and 2D output
+                    if y_pred.ndim == 2:
+                        y_pred = y_pred[:, 0]
+                    elif y_pred.ndim == 1:
+                        pass  # Already 1D, use as is
+                    elif y_pred.ndim == 0:
+                        # Scalar output, expand to match y_vals
+                        y_pred = np.full_like(y_vals, y_pred.item())
+                    else:
+                        raise ValueError(f"Unexpected y_pred shape: {y_pred.shape}")
+                    
+                    # Ensure both are numpy arrays (not PyTorch tensors)
+                    y_vals_np = np.asarray(y_vals)
+                    y_pred_np = np.asarray(y_pred)
+                    
+                    metrics = compute_metrics(
+                        {"true": [y_vals_np], "predicted": [y_pred_np], "predicted_tree": [best_tree]},
+                        metrics="r2"
+                    )
+                    r2 = metrics['r2'][0]
+                    if r2 < 0:
+                        r2 = 0
+                    print(f"R2: {r2}")
+                    results.append(r2)
+                else:
+                    print("Refinement failed to produce candidates.")
+
+            except Exception as e:
+                import traceback
+                print(f"Error in test case {i}: {e}")
+                traceback.print_exc()
+                continue
+
+
+    valid_results = [r for r in results if r is not None and not np.isnan(r)]
+    r2_099 = sum(1 for r in valid_results if r > 0.99)
+    r2_mean = float(np.mean(valid_results)) if valid_results else float('nan')
+    print(f"\nSummary: R2>0.99: {r2_099}/{len(valid_results)}, R2 mean: {r2_mean:.6f}")
+    
+    if return_results:
+        return results
+
+def main():
+    parser = get_parser()
+    parser.add_argument('--encoder_type', type=str, default='e2e', choices=['e2e', 'snip'])
+    parser.add_argument('--e2e_checkpoint', type=str, default='../OG-DSR_snip_prev/weights/e2e.pt')
+    parser.add_argument('--snip_checkpoint', type=str, default='../OG-DSR_snip_prev/weights/snip-10dmax.pth')
+    parser.add_argument('--model_path', type=str, default='./best_model.pth', help='Path to trained MODSR model')
+    parser.add_argument('--n_tests', type=int, default=10)
+    parser.add_argument('--traditional_bench', action='store_true', help='Use traditional benchmark tests from file')
+    parser.add_argument('--benchmark_path', type=str, default='./assets/benchmarks.csv', help='Path to benchmark csv (optional)')
+    
+    # FEX Head Arguments
+    parser.add_argument('--fex_head_checkpoint', type=str, default='./best_fex_head.pth', help='Path to FEX Head checkpoint')
+    parser.add_argument("--use_gradient_guidance", type=str, default="false", help="Enable gradient guidance during sampling")
+    
+    # length
+    parser.add_argument("--guidance_length_window", type=int, default=50, help="Random window size for length guidance (0 = full sequence).")
+    parser.add_argument("--guidance_length_min_active", type=int, default=4, help="Minimum active nodes required inside the length window.")
+        
+    # mse
+    parser.add_argument("--guidance_scale", type=float, default=1000.0, help="Scale of the gradient guidance (no sigma_t damping now)")
+    parser.add_argument("--guidance_temperature", type=float, default=2.0, help="Temperature for Softmax in guidance")
+    parser.add_argument("--guidance_use_metasymnet_penalty", type=lambda x: x.lower() in ('true', '1', 'yes'), default=True, help="Use MetaSymNet style sharpness penalty")
+    parser.add_argument("--guidance_topk", type=int, default=3, help="Top-K candidates per position during guidance.")
+    parser.add_argument("--guidance_max_batch", type=int, default=20, help="Maximum samples per guidance step.")
+    parser.add_argument("--guidance_pow_top1_only", type=str, default="true", help="Allow pow2/pow3 only when top-1 unary token.")
+    parser.add_argument("--guidance_num_points", type=int, default=50, help="Use only first N data points for guidance (0 = all).")
+    parser.add_argument("--guidance_objective", type=str, default="mse", help="Guidance objective: 'mse' or 'length'.")
+    parser.add_argument("--guidance_subtree_depth", type=int, default=6, help="Depth of subtree used during gradient guidance (0 = entire tree).")
+    parser.add_argument("--guidance_logit_clip", type=float, default=20.0, help="Clamp value for guidance logits (after subtracting row max).")
+    parser.add_argument("--guidance_loss01_weight", type=float, default=0.05, help="Weight for 0-1 regularizer during guidance.")
+    parser.add_argument("--guidance_grad_clip", type=float, default=1000.0, help="Gradient clip value for guidance signal.")
+    parser.add_argument("--guidance_normalize_grad", type=str, default="true", help="Normalize guidance gradient to unit norm before applying.")
+    parser.add_argument("--guidance_inner_steps", type=int, default=10, help="Number of inner guidance optimization steps per diffusion timestep (used by both autograd and bfgs).")
+    parser.add_argument("--guidance_inner_lr", type=float, default=1.0, help="Step size used during inner guidance optimization.")
+    parser.add_argument("--guidance_inner_optimizer", type=str, default="autograd", choices=["autograd", "bfgs"], help="Inner guidance optimizer backend.")
+    # scheduler
+    parser.add_argument("--guidance_t_min", type=float, default=0.3, help="Minimum normalized timestep for guidance (late stage cutoff).")
+    parser.add_argument("--guidance_t_max", type=float, default=0.7, help="Maximum normalized timestep for guidance (early stage cutoff).")
+    parser.add_argument("--guidance_max_steps", type=int, default=5, help="Maximum number of guidance steps to apply.")
+    # viz
+    parser.add_argument("--guidance_video_dir", type=str, default="./videos", help="Directory to save guidance subtree visualization frames/videos. Empty to disable.")
+    parser.add_argument("--guidance_video_fps", type=int, default=2, help="FPS for exported guidance video.")
+    parser.add_argument("--guidance_video_topk", type=int, default=3, help="Top-k tokens shown in each node visualization.")
+    parser.add_argument("--guidance_video_width_scale", type=float, default=1.8, help="Horizontal scale factor to make subtree rendering wider.")
+    parser.add_argument("--guidance_video_eval_points", type=int, default=5, help="Number of test points listed in the per-frame value table.")
+    # perturb
+    parser.add_argument("--use_perturb_optimization", type=str, default="false", help="Enable perturb-style perturbation-reconstruction optimization.")
+    parser.add_argument("--perturb_rewrite_steps", type=int, default=3, help="Number of perturb rewrite iterations.")
+    parser.add_argument("--perturb_rewrite_ratio", type=float, default=0.25, help="Perturbation ratio α for perturb (0.0-1.0) controlling structure disruption.")
+    
+    # Panczyk-KAN benchmark datasets (exclude 12D and 13D: rea, fp)
+    parser.add_argument("--panczyk_dataset", type=str, default=None, 
+                       choices=['bwr', 'chf', 'htgr', 'mitr', 'xs', 'heat'],
+                       help="Use Panczyk-KAN nuclear engineering benchmark dataset. If set, overrides --traditional_bench and test case generation.")
+    parser.add_argument("--panczyk_n_points", type=int, default=200, help="Number of points to sample from each Panczyk-KAN dataset (default 200, like traditional benchmark).")
+    parser.add_argument("--panczyk_all", action='store_true', help="Run on all Panczyk-KAN datasets and print summary.")
+
+
+    params = parser.parse_args()
+    
+    # Parse boolean string content
+    params.use_gradient_guidance = str(params.use_gradient_guidance).lower() == 'true'
+    params.guidance_pow_top1_only = str(params.guidance_pow_top1_only).lower() == 'true'
+    params.use_perturb_optimization = str(params.use_perturb_optimization).lower() == 'true'
+    params.guidance_normalize_grad = str(params.guidance_normalize_grad).lower() == 'true'
+    if params.guidance_inner_steps <= 0:
+        params.guidance_inner_steps = 1
+    if params.guidance_inner_lr <= 0:
+        params.guidance_inner_lr = 1.0
+    if params.guidance_num_points <= 0:
+        params.guidance_num_points = None
+    if hasattr(params, "guidance_objective"):
+        params.guidance_objective = params.guidance_objective.lower()
+    else:
+        params.guidance_objective = "mse"
+    if params.guidance_length_window <= 0:
+        params.guidance_length_window = None
+    if params.guidance_length_min_active <= 0:
+        params.guidance_length_min_active = 1
+    if params.guidance_subtree_depth is not None and params.guidance_subtree_depth <= 0:
+        params.guidance_subtree_depth = None
+    if params.guidance_grad_clip is not None and params.guidance_grad_clip <= 0:
+        params.guidance_grad_clip = None
+    if not params.guidance_video_dir:
+        params.guidance_video_dir = None
+    if params.guidance_video_fps <= 0:
+        params.guidance_video_fps = 2
+    if params.guidance_video_topk <= 0:
+        params.guidance_video_topk = 3
+    if params.guidance_video_width_scale <= 0:
+        params.guidance_video_width_scale = 1.8
+    if params.guidance_video_eval_points <= 0:
+        params.guidance_video_eval_points = 5
+
+    # Set random seeds for reproducibility
+    seed = 12345
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    import random
+    random.seed(seed)
+    
+    
+    if torch.cuda.is_available() and not params.cpu:
+        params.device = 'cuda'
+    elif hasattr(torch, 'npu') and torch.npu.is_available() and not params.cpu:
+        params.device = 'npu'
+    else:
+        params.device = 'cpu'
+    params.max_input_dimension = 10
+    params.use_repa = True
+    params.use_negative_constants = False
+
+    # Defaults needed for environment
+    if not hasattr(params, 'batch_size_eval') or params.batch_size_eval is None: params.batch_size_eval = 1
+    if not hasattr(params, 'eval_size') or params.eval_size is None: params.eval_size = 100
+    
+    # Standard env creation
+    env = build_env(params)
+    
+    # Setup FEX environment if checkpoint provided
+    env_fex = None
+    fex_encoder = None
+    if params.fex_head_checkpoint:
+        logger.info("Setting up FEX Environment...")
+        params_fex = copy.deepcopy(params)
+        params_fex.use_negative_constants = True
+        params_fex.use_fex_encoder = True
+        env_fex = build_env(params_fex)
+        fex_encoder = FixedTreeEncoder(depth=params.fex_tree_depth, env=env_fex)
+        logger.info("FEX Environment ready.")
+    
+    # Load model
+    logger.info("Creating MODSR model...")
+    model = MODSRModel(
+        params=params,
+        env=env,
+        checkpoint_path=params.e2e_checkpoint if params.encoder_type == 'e2e' else params.snip_checkpoint,
+        encoder_type=params.encoder_type,
+        fex_head_checkpoint=params.fex_head_checkpoint,  # Only FEX script loads the head
+        fex_head_env=env_fex,
+    )
+    # Set guidance scheduler params
+    model.guidance_t_min = params.guidance_t_min
+    model.guidance_t_max = params.guidance_t_max
+    model.guidance_max_steps = params.guidance_max_steps
+    model.guidance_use_metasymnet_penalty = params.guidance_use_metasymnet_penalty
+    
+    # Load trained weights
+    logger.info(f"Loading trained model from {params.model_path}")
+    checkpoint = torch.load(params.model_path, map_location=params.device, weights_only=False)
+
+    # Handle Embedding Size Mismatch BEFORE loading
+    # Checkpoint typically has 10292 (25 dim), Env has 10277 (10 dim) if max_input_dimension=10
+    emb_weight = None
+    gen_sd = None
+    if 'generator_state_dict' in checkpoint:
+        gen_sd = checkpoint['generator_state_dict']
+    elif 'decoder_state_dict' in checkpoint: # some old format
+        gen_sd = checkpoint['decoder_state_dict']
+    
+    # Try to find embedding weights in gen_sd
+    if gen_sd is not None:
+         if "token_embedding.weight" in gen_sd:
+            emb_weight = gen_sd["token_embedding.weight"]
+         elif "module.token_embedding.weight" in gen_sd:
+            emb_weight = gen_sd["module.token_embedding.weight"]
+    
+    # If not found in generator part, try root level if checkpoint is flat
+    if emb_weight is None and isinstance(checkpoint, dict):
+        if "generator.token_embedding.weight" in checkpoint:
+            emb_weight = checkpoint["generator.token_embedding.weight"]
+    
+    if emb_weight is not None:
+         ckpt_vocab_size = emb_weight.shape[0]
+         model_vocab_size = model.generator.token_embedding.num_embeddings
+         if ckpt_vocab_size != model_vocab_size:
+            logger.warning(f"Vocab size mismatch! Ckpt: {ckpt_vocab_size}, Model: {model_vocab_size}")
+            logger.warning(f"Resizing model embedding layer to {ckpt_vocab_size} to allow loading.")
+            # CRITICAL FIX: To match train_fex_head.py, we must NOT set padding_idx.
+            new_emb = torch.nn.Embedding(ckpt_vocab_size, model.generator.embedding_dim, padding_idx=None)
+            new_emb.to(params.device)
+            model.generator.token_embedding = new_emb
+            model.generator.vocab_size = ckpt_vocab_size
+
+    # Also fix it if no resize was needed but padding_idx exists (e.g. model built with pad_idx)
+    if model.generator.token_embedding.padding_idx is not None:
+        logger.info("Removing padding_idx from token_embedding to match train_fex_head_2 behavior.")
+        model.generator.token_embedding.padding_idx = -1
+    
+    if 'generator_state_dict' in checkpoint:
+        gen_sd = checkpoint['generator_state_dict']
+        # Handle missing buffers from older checkpoints (constraints logic)
+        model_sd = model.generator.state_dict()
+        for key in ["position_type_ids", "type_allowed_mask"]:
+            if key in model_sd and key not in gen_sd:
+                gen_sd[key] = model_sd[key]
+        
+        model.generator.load_state_dict(gen_sd)
+        logger.info("Loaded generator_state_dict")
+    elif 'decoder_state_dict' in checkpoint:
+        model.generator.load_state_dict(checkpoint['decoder_state_dict'])
+        logger.info("Loaded decoder_state_dict")
+    else:
+        # Try loading directly if it's a raw state dict or something else
+        try:
+            model.load_state_dict(checkpoint)
+            logger.info("Loaded full state dict")
+        except Exception as e:
+            logger.error(f"Failed to load state dict: {e}")
+            logger.warning("Could not load state dict directly, trying to load generator only")
+            # If full load fails (e.g. encoder mismatch), try loading generator parts manually
+            try:
+                model_sd = model.state_dict()
+                filtered_ckpt = {k: v for k, v in checkpoint.items() if k in model_sd and v.shape == model_sd[k].shape}
+                model.load_state_dict(filtered_ckpt, strict=False)
+                logger.info(f"Loaded {len(filtered_ckpt)} matching keys (partial load).")
+            except Exception as e2:
+                raise ValueError("Failed to load model state dict. Please check the checkpoint and model configuration.")
+
+    model = model.to(params.device)
+    
+    # Load Panczyk-KAN benchmark if specified
+    if params.panczyk_all or params.panczyk_dataset:
+        from tools.panczyk_kan_adapter import load_panczyk_kan_benchmark
+        
+        if params.panczyk_all:
+            # Load all datasets
+            datasets = ['bwr', 'chf', 'htgr', 'mitr', 'xs', 'heat']
+        else:
+            # Load single dataset
+            datasets = [params.panczyk_dataset]
+            
+        logger.info(f"Loading Panczyk-KAN datasets: {datasets} (n_points={params.panczyk_n_points})")
+        test_cases = load_panczyk_kan_benchmark(datasets=datasets, n_points=params.panczyk_n_points, seed=seed)
+        logger.info(f"Loaded {len(test_cases)} datasets from Panczyk-KAN")
+        
+    elif params.traditional_bench and params.benchmark_path:
+        test_cases = load_benchmark_test_cases(params.benchmark_path, env)
+        logger.info(f"Loaded {len(test_cases)} benchmarks.")
+    else:
+        test_cases = None
+        
+    test_modsr(model, env, params, test_cases=test_cases, num_samples=params.n_tests, fex_encoder=fex_encoder, env_fex=env_fex)
+if __name__ == "__main__":
+    main()

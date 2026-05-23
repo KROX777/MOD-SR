@@ -1,0 +1,14 @@
+name,variables,expression
+bacres1,2,20-x1-(x1*x2)/(1+0.5*x1**2)
+bacres2,2,10-(x1*x2)/(1+0.5*x1**2)
+barmag1,2,0.5*sin(x1-x2)-sin(x1)
+barmag2,2,0.5*sin(x2-x1)-sin(x2)
+glider1,2,-0.05*x1**2-sin(x2)
+glider2,2,x1-cos(x2)/x1
+lv1,2,3*x1-2*x1*x2-x1**2
+lv2,2,2*x2-x1*x2-x2**2
+predprey1,2,x1*(4-x1-(x2/(1+x1)))
+predprey2,2,x2*(x1/(1+x1)-0.075*x2)
+shearflow1,2,cot(x2)*cos(x1)
+shearflow2,2,(cos(x2)**2+0.1*sin(x2)**2)*sin(x1)
+vdp1,2,10*(x2-(1/3)*(x1**3-x2))

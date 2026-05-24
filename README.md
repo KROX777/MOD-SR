@@ -15,7 +15,7 @@ MOD-SR studies symbolic regression as a multimodal conditional generation proble
 - **Diffusion-based symbolic regression**: generate expressions in continuous representation space instead of purely autoregressive token decoding.
 - **Multimodal conditioning**: support both E2E and SNIP numeric encoders; the SNIP branch uses token-wise pre-pooled features for cross-attention.
 - **REPA alignment**: align intermediate diffusion features with a frozen SNIP symbolic encoder.
-- **FEX execution space**: convert expressions into a fixed-tree representation for differentiable execution and structural guidance.
+- **DFEX execution space**: convert expressions into a fixed-tree representation for differentiable execution and structural guidance.
 - **Gradient guidance**: inject objective gradients during sampling to steer generation toward lower regression error or simpler expressions.
 
 ### Repository Structure
@@ -95,7 +95,7 @@ Please refer to `run_modsr.sh`
 
 ## License
 
-This project is licensed under the MIT License (Copyright 2025 Chuyang Xiang).
+This project is licensed under the MIT License (Copyright 2026 Chuyang Xiang).
 
 Portions of this project are derived from the Facebook Research Symbolic Regression 
 project (https://github.com/facebookresearch/symbolicregression), licensed under 

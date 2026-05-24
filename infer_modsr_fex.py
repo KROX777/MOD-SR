@@ -463,8 +463,8 @@ def test_modsr(model, env, params, test_cases=None, num_samples=50, top_k=20, se
 def main():
     parser = get_parser()
     parser.add_argument('--encoder_type', type=str, default='e2e', choices=['e2e', 'snip'])
-    parser.add_argument('--e2e_checkpoint', type=str, default='../OG-DSR_snip_prev/weights/e2e.pt')
-    parser.add_argument('--snip_checkpoint', type=str, default='../OG-DSR_snip_prev/weights/snip-10dmax.pth')
+    parser.add_argument('--e2e_checkpoint', type=str, default='./weights/e2e.pt')
+    parser.add_argument('--snip_checkpoint', type=str, default='./weights/snip-10dmax.pth')
     parser.add_argument('--model_path', type=str, default='./best_model.pth', help='Path to trained MODSR model')
     parser.add_argument('--n_tests', type=int, default=10)
     parser.add_argument('--traditional_bench', action='store_true', help='Use traditional benchmark tests from file')

@@ -849,7 +849,7 @@ if __name__ == '__main__':
     parser.add_argument("--max_epoch_size", type=int, default=10000, help="Number of samples per epoch")
     parser.add_argument("--debug_log_every", type=int, default=1000, help="Debug log frequency")
     parser.add_argument("--eval_mode", action="store_true", help="Run evaluation mode to convert tokens via the FEX head")
-    parser.add_argument("--fex_head_checkpoint", type=str, default="/home/ma-user/work/OG-DSR/dump_fex_head_parallel_new3/best_fex_head.pth", help="Path to trained FEX head checkpoint (required for eval_mode)")
+    parser.add_argument("--fex_head_checkpoint", type=str, default="./weights/best_fex_head.pth", help="Path to trained FEX head checkpoint (required for eval_mode)")
     parser.add_argument("--eval_tokens", nargs='+', default=None, help="MODSR tokens to convert in eval_mode")
     
     args, unknown = parser.parse_known_args()

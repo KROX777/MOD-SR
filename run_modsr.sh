@@ -91,25 +91,10 @@ python infer_modsr_fex.py --traditional_bench
 
 python infer_modsr_fex.py --traditional_bench \
     --use_gradient_guidance True \
-    --benchmark_path ./assets/benchmarks_lite.csv \
+    --benchmark_path ./assets/benchmarks.csv \
     --guidance_scale 1000.0 \
     --guidance_inner_optimizer bfgs \
     --guidance_inner_steps 10 \
     --guidance_subtree_depth 8 \
     --fex_head_checkpoint ./best_fex_head.pth \
-    --fex_tree_depth 8 \
-
-
-
-
-
-
-
-# --- Deprecated ---
-
-setsid python tools/collect_fex_priors.py \
-    --fex_prior_samples 200000 \
-    --fex_prior_output ./assets/fex_priors_d8f2.json \
-    --use_fex_encoder --use_negative_constants \
-    --fex_tree_depth 8 --max_input_dimension 10 --float_precision 2 \
-    --collect_num_workers 8
+    --fex_tree_depth 8

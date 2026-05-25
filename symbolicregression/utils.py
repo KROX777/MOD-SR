@@ -15,6 +15,7 @@ import random
 import getpass
 import argparse
 import subprocess
+import logging
 import torch
 
 try:
@@ -295,6 +296,7 @@ def safe_torch_load(path, map_location=None):
     """
     Wrapper around torch.load that adds the numpy scalar global to the safe list
     and forces weights_only=False when supported (PyTorch 2.6+).
+    Handles NPU serialization issues by providing dummy modules.
     """
     load_kwargs = {}
     if map_location is not None:
@@ -308,11 +310,28 @@ def safe_torch_load(path, map_location=None):
             pass
     except Exception:
         pass
+
+    # NPU serialization may reference modules that don't exist on this system
+    import sys, types
+    _dummy_modules = {}
+    for _mod_name in ['torch_npu.utils._device']:
+        if _mod_name not in sys.modules:
+            _dummy = types.ModuleType(_mod_name)
+            _NPUCls = type('_NPUStub', (), {'__init__': lambda s,*a,**kw: None})
+            _dummy.Device = _NPUCls
+            _dummy.NPUDevice = _NPUCls
+            sys.modules[_mod_name] = _dummy
+            _dummy_modules[_mod_name] = _dummy
+
     try:
-        return torch.load(path, weights_only=False, **load_kwargs)
-    except TypeError:
-        # older torch versions without weights_only flag
-        return torch.load(path, **load_kwargs)
+        try:
+            return torch.load(path, weights_only=False, **load_kwargs)
+        except TypeError:
+            return torch.load(path, **load_kwargs)
+    finally:
+        for _mod_name, _dummy in _dummy_modules.items():
+            if sys.modules.get(_mod_name) is _dummy:
+                del sys.modules[_mod_name]
 
 
 def get_model(model):
@@ -359,7 +378,7 @@ def load_benchmark_test_cases(benchmark_path, env, n_points=200):
     """
     Load benchmark expressions from CSV and generate datapoints.
     """
-    logger = create_logger("benchmark_loader.log", rank=0)
+    logger = logging.getLogger(__name__)
     
     if not os.path.exists(benchmark_path):
         logger.error(f"Benchmark file not found: {benchmark_path}")

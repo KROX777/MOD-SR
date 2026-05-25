@@ -5,6 +5,8 @@ import os
 import copy
 import numpy as np
 import sympy as sp
+import re
+from collections import defaultdict
 from tqdm import tqdm
 from parsers import get_parser
 from symbolicregression.envs import build_env
@@ -13,7 +15,7 @@ from symbolicregression.envs.fixed_tree_encoder import FixedTreeEncoder
 from generate_test_cases import generate_test_cases
 from tools.const_opt import refine
 from symbolicregression.metrics import compute_metrics
-from symbolicregression.utils import process_benchmark_string, load_benchmark_test_cases, get_model
+from symbolicregression.utils import load_benchmark_test_cases, get_model
 
 logging.basicConfig(
     level=logging.INFO,
@@ -79,23 +81,23 @@ def apply_constraints(tokens, logits, env, batch_size=5):
     """
     if env is None:
         return tokens
-        
+
     decoder_constraints = env.get_decoder_constraints()
     if decoder_constraints is None:
         return tokens
-    
+
     device = tokens.device
     pos_types, allowed_mask = decoder_constraints
     pos_types = pos_types.cpu()
     allowed_mask = allowed_mask.cpu()
-    
+
     constraints = env.get_fex_leaf_constraints()
     leaf_pairs = constraints.get('leaf_pairs', []) if constraints else []
     vocab_size = logits.size(-1)
     seq_len = min(logits.size(1), len(pos_types))
     min_val = torch.finfo(logits.dtype).min
     pad_id = env.equation_word2id.get('<PAD>')
-    
+
     # Pre-create masks on CPU
     mantissa_mask = torch.zeros(vocab_size, dtype=torch.bool)
     sign_mask = torch.zeros(vocab_size, dtype=torch.bool)
@@ -104,53 +106,237 @@ def apply_constraints(tokens, logits, env, batch_size=5):
         sign_mask[constraints['sign_ids']] = True
     exp_ids = torch.tensor(constraints['exponent_ids']) if constraints else torch.tensor([])
     var_ids = torch.tensor(constraints['variable_ids']) if constraints else torch.tensor([])
-    
+
     # Process in batches to avoid NPU memory spike
     adjusted_list = []
     total = tokens.size(0)
-    
+
     for start in range(0, total, batch_size):
         end = min(start + batch_size, total)
         # Move batch to CPU, process, immediately move back
         tok_batch = tokens[start:end].cpu()
         log_batch = logits[start:end].cpu()
-        
+
         # Position constraints
         valid_mask = allowed_mask[pos_types[:seq_len]]
         curr_logits = log_batch[:, :seq_len, :].clone()
         curr_logits[~valid_mask.unsqueeze(0).expand(curr_logits.size(0), -1, -1)] = min_val
         tok_batch[:, :seq_len] = curr_logits.argmax(dim=-1)
-        
+
         # Leaf pair constraints
         for pos1_idx, pos2_idx in leaf_pairs:
             if pos1_idx >= seq_len or pos2_idx >= seq_len:
                 continue
             pos2_tok = tok_batch[:, pos2_idx]
-            
+
             is_exp = torch.isin(pos2_tok, exp_ids) if len(exp_ids) > 0 else torch.zeros_like(pos2_tok, dtype=torch.bool)
             if is_exp.any():
                 l = log_batch[:, pos1_idx, :].clone()
                 l[:, ~mantissa_mask] = min_val
                 tok_batch[is_exp, pos1_idx] = l.argmax(dim=-1)[is_exp]
-            
+
             is_var = torch.isin(pos2_tok, var_ids) if len(var_ids) > 0 else torch.zeros_like(pos2_tok, dtype=torch.bool)
             if is_var.any():
                 l = log_batch[:, pos1_idx, :].clone()
                 l[:, ~sign_mask] = min_val
                 tok_batch[is_var, pos1_idx] = l.argmax(dim=-1)[is_var]
-            
+
             if pad_id is not None:
                 is_pad = (pos2_tok == pad_id)
                 if is_pad.any():
                     tok_batch[is_pad, pos1_idx] = pad_id
-        
+
         adjusted_list.append(tok_batch.to(device))
         # Explicit cleanup
         del tok_batch, log_batch, curr_logits
         if hasattr(torch, 'npu') and 'npu' in str(device):
             torch.npu.empty_cache()
-    
+
     return torch.cat(adjusted_list, dim=0)
+
+
+# ---------------------------------------------------------------------------
+# Complexity computation (from calc_complexity.py)
+# ---------------------------------------------------------------------------
+
+FUNC_NAMES = ['pow', 'sin', 'cos', 'exp', 'log', 'sqrt', 'abs', 'inv', 'arctan', 'tan', 'atan', 'mul', 'add', 'sub', 'div']
+FUNC_RE = re.compile(r"\b(?:" + "|".join(re.escape(fn) for fn in FUNC_NAMES) + r")\b")
+VAR_RE = re.compile(r"\bx_\d+\b")
+NUM_RE = re.compile(r"-?\d+\.?\d*(?:[eE][+-]?\d+)?")
+
+
+def zero_small_numbers_str(s, thresh=1e-3):
+    def repl(m):
+        num = m.group(0)
+        try:
+            v = float(num)
+        except Exception:
+            return num
+        return '0' if abs(v) < thresh else num
+    return re.sub(r'(?<![A-Za-z0-9_.-])(-?\d+\.?\d*(?:[eE][+-]?\d+)?)', repl, s)
+
+
+def dsl_to_sympy_string(s):
+    s = re.sub(r'\barctan\b', 'atan', s)
+    s = re.sub(r'\badd\b', '+', s)
+    s = re.sub(r'\bsub\b', '-', s)
+    s = re.sub(r'\bmul\b', '*', s)
+    s = re.sub(r'\bdiv\b', '/', s)
+    s = re.sub(r'\bpow\b', '**', s)
+    s = s.replace('(', ' ( ').replace(')', ' ) ')
+    s = re.sub(r'\s+', ' ', s).strip()
+    for fn in ['sin', 'cos', 'exp', 'log', 'sqrt', 'abs', 'atan', 'tan']:
+        s = re.sub(rf'\b{fn}\s+\(', f'{fn}(', s)
+    s = s.replace(', ', ',')
+    return s
+
+
+def complexity_of(expr):
+    s0 = zero_small_numbers_str(expr)
+    sympy_candidate = dsl_to_sympy_string(s0)
+
+    var_names = set(re.findall(r"x_\d+", sympy_candidate))
+    local_dict = {name: sp.symbols(name) for name in var_names}
+
+    try:
+        sexpr = sp.sympify(sympy_candidate, locals=local_dict)
+        s_simpl_obj = sp.simplify(sexpr)
+        s_simpl = str(s_simpl_obj)
+    except Exception:
+        funcs = len(FUNC_RE.findall(s0))
+        vars_ = len(VAR_RE.findall(s0))
+        nums = len(NUM_RE.findall(s0))
+        return s0, s0, (funcs + vars_ + nums)
+
+    funcs_cnt = 0
+    ops_cnt = 0
+    vars_cnt = 0
+    nums_cnt = 0
+
+    def traverse(node, in_pow_exp=False):
+        nonlocal funcs_cnt, ops_cnt, vars_cnt, nums_cnt
+        try:
+            if getattr(node, 'is_Function', False):
+                funcs_cnt += 1
+                for a in node.args:
+                    traverse(a, in_pow_exp=False)
+                return
+        except Exception:
+            pass
+
+        if isinstance(node, sp.Pow):
+            ops_cnt += 1
+            base, exp = node.args
+            traverse(base, in_pow_exp=False)
+            traverse(exp, in_pow_exp=True)
+            return
+
+        if isinstance(node, (sp.Add, sp.Mul)):
+            ops_cnt += 1
+            for a in node.args:
+                traverse(a, in_pow_exp=False)
+            return
+
+        if isinstance(node, sp.Symbol):
+            vars_cnt += 1
+            return
+
+        if isinstance(node, sp.Number):
+            if not in_pow_exp:
+                nums_cnt += 1
+            return
+
+        for a in getattr(node, 'args', ()):
+            traverse(a, in_pow_exp=False)
+
+    traverse(s_simpl_obj, in_pow_exp=False)
+
+    return s0, s_simpl, (funcs_cnt + ops_cnt + vars_cnt + nums_cnt)
+
+
+# ---------------------------------------------------------------------------
+# Benchmark group statistics (from calculate_benchmark_stats.py)
+# ---------------------------------------------------------------------------
+
+BENCHMARK_GROUPS = {
+    'Nguyen': [f'Nguyen-{i}' for i in range(1, 13)],
+    'Keijzer': [f'Keijzer-{i}' for i in range(3, 16)],
+    'Koza': ['Koza-2', 'Koza-3'],
+    'Constant': [f'Constant-{i}' for i in range(1, 9)],
+    'Livermore': [f'Livermore-{i}' for i in range(1, 23)],
+    'R': ['R1', 'R2', 'R3'],
+    'Jin': [f'Jin-{i}' for i in range(1, 7)],
+    'Vladislavleva': [f'Vladislavleva{i}' for i in range(1, 9)],
+}
+
+
+def compute_benchmark_stats(csv_rows, r2_col='r2', complexity_col='complexity', name_col='name'):
+    """
+    Compute per-group and overall statistics from a list of result dicts.
+    Each dict must have keys: name_col, r2_col, complexity_col.
+    """
+    data = defaultdict(list)
+    for row in csv_rows:
+        name = row.get(name_col, '').strip()
+        r2_val = row.get(r2_col, '')
+        c_val = row.get(complexity_col, '')
+        if r2_val == '' or c_val == '':
+            continue
+        try:
+            r2 = float(r2_val)
+            complexity = float(c_val)
+            if r2 != r2 or r2 < 0:
+                r2 = 0.0
+        except (ValueError, TypeError):
+            continue
+        data[name].append((r2, complexity))
+
+    all_grouped = set()
+    for bench_list in BENCHMARK_GROUPS.values():
+        all_grouped.update(bench_list)
+
+    results = {}
+    for group_name, benchmarks in BENCHMARK_GROUPS.items():
+        all_r2 = []
+        all_complexity = []
+        above_999 = 0
+        for bench in benchmarks:
+            if bench in data:
+                for r2, comp in data[bench]:
+                    all_r2.append(r2)
+                    all_complexity.append(comp)
+                    if r2 > 0.999:
+                        above_999 += 1
+        if all_r2:
+            avg_r2 = sum(all_r2) / len(all_r2)
+            avg_complexity = sum(all_complexity) / len(all_complexity)
+            pct_above_999 = (above_999 / len(all_r2)) * 100
+            results[group_name] = {
+                'avg_r2': avg_r2,
+                'avg_complexity': avg_complexity,
+                'pct_above_999': pct_above_999,
+            }
+
+    others_r2 = []
+    others_complexity = []
+    for bench in data:
+        if bench not in all_grouped:
+            for r2, comp in data[bench]:
+                others_r2.append(r2)
+                others_complexity.append(comp)
+    if others_r2:
+        avg_r2 = sum(others_r2) / len(others_r2)
+        avg_complexity = sum(others_complexity) / len(others_complexity)
+        others_above_999 = sum(1 for r2 in others_r2 if r2 > 0.999)
+        pct_above_999 = (others_above_999 / len(others_r2)) * 100
+        results['Others'] = {
+            'avg_r2': avg_r2,
+            'avg_complexity': avg_complexity,
+            'pct_above_999': pct_above_999,
+        }
+
+    return results
+
 
 def perturb_optimize_with_guidance(
     model,
@@ -182,7 +368,7 @@ def perturb_optimize_with_guidance(
 
     total_timesteps = raw_model.scheduler.num_timesteps
     perturb_timesteps = max(1, int(total_timesteps * rewrite_ratio))
-    
+
     # T2T time window: [0, rewrite_ratio] (normalized), force 2 guidance steps
     original_t_min = getattr(raw_model, 'guidance_t_min', 0.3)
     original_t_max = getattr(raw_model, 'guidance_t_max', 0.7)
@@ -200,7 +386,7 @@ def perturb_optimize_with_guidance(
         raw_model.guidance_t_min = 0.0  # Start from timestep 0
         raw_model.guidance_t_max = rewrite_ratio  # Up to perturbation level
         raw_model.guidance_max_steps = 2  # Exactly 2 guidance steps
-        
+
         try:
             with torch.no_grad():
                 current_tokens, current_logits = raw_model.sample_with_guidance(
@@ -226,62 +412,51 @@ def perturb_optimize_with_guidance(
     return current_tokens, current_logits, []
 
 
-def test_modsr(model, env, params, test_cases=None, num_samples=50, top_k=20, seed=42, fex_encoder=None, env_fex=None, return_results=False):
+def test_modsr(model, env, params, test_cases=None, num_samples=50, top_k=20, seed=42, fex_encoder=None, env_fex=None):
     """
-    Test MODSR model.
-    
-    Args:
-        return_results: If True, return the list of R2 results instead of printing summary
+    Test MODSR model. Returns list of dicts with name, gt_expr, pred_expr, r2.
     """
     if test_cases is None:
         logger.info(f"Generating {num_samples} test cases with seed={seed}...")
         test_cases = generate_test_cases(n_tests=num_samples, seed=seed, max_input_dimension=params.max_test_input_dimension, params=params)
-    
+
     if len(test_cases) == 0:
         logger.warning("No test cases generated/loaded!")
-        return [] if return_results else None
+        return []
 
     logger.info(f"Running inference on {len(test_cases)} test cases...")
-    
+
     model.eval()
     raw_model = get_model(model)
     device = params.device if hasattr(params, 'device') else raw_model.device
-    
+
     results = []
-    
-    # Check if this is Panczyk-KAN dataset
-    is_panczyk = len(test_cases) > 0 and test_cases[0].get('dataset') in ['bwr', 'chf', 'htgr', 'mitr', 'xs', 'heat']
+    collected_results = []
 
     with torch.no_grad():
         for i, test_case in enumerate(tqdm(test_cases, desc="Inference")):
             gt_expr = test_case.get('gt_expr')
-            dataset_name = test_case.get('dataset', 'unknown')
-            test_name = test_case.get('name', f"Test {i}")
-            
+            name = test_case.get('name', f'test_{i}')
+
             print(f"\n{'='*50}")
-            if is_panczyk:
-                n_samples = test_case.get('n_samples', 'unknown')
-                n_features = test_case.get('n_features', 'unknown')
-                print(f"Dataset: {dataset_name.upper()} ({n_samples} samples, {n_features} features)")
-            else:
-                print(f"GT: {gt_expr}")
+            print(f"Name: {name}  GT: {gt_expr}")
 
             try:
                 x_grid = test_case['x_grid']
                 y_vals = test_case['y_vals']
-                
+
                 # Ensure y_vals is 2D (n_points, 1) to match traditional benchmark format
                 if y_vals.ndim == 1:
                     y_vals = y_vals.reshape(-1, 1)
-                
+
                 # Use the dataset directly (same format as traditional benchmark)
                 samples = {
                     'x_to_fit': [torch.from_numpy(x_grid).float().to(device)],
                     'y_to_fit': [torch.from_numpy(y_vals).float().to(device)],
                     'gt_expr': [gt_expr],
                 }
-                
-                # (1) Direct embedding -> FEX head                
+
+                # (1) Direct embedding -> FEX head
                 if getattr(params, "use_perturb_optimization", False):
                     logger.info(f"Using Perturb Optimization (rewrite_steps={params.perturb_rewrite_steps}, ratio={params.perturb_rewrite_ratio})")
                     if env_fex is None or getattr(env_fex, "fex_encoder", None) is None:
@@ -323,13 +498,13 @@ def test_modsr(model, env, params, test_cases=None, num_samples=50, top_k=20, se
                         ddim_steps=50,
                         use_fex_head=True
                     )
-                    
+
                 direct_tokens = apply_constraints(direct_tokens, direct_logits, env_fex)
                 # print("Direct embedding -> FEX head expressions (top 3):")
                 # for k in range(min(top_k, 3)):
                 #     tree = decode_fex_tokens(env_fex, direct_tokens[k])
                 #     print(f"  Sample {k}: {tree}")
-                
+
                 candidates = []
                 eos_id = env_fex.equation_word2id.get("<EOS>", None)
                 for k in range(top_k):
@@ -346,25 +521,25 @@ def test_modsr(model, env, params, test_cases=None, num_samples=50, top_k=20, se
                         tree = None
                     if tree is not None:
                         candidates.append(tree)
-                
+
                 if len(candidates) == 0:
                     print("No valid candidates generated.")
                     continue
-                
+
                 y_vals_refine = y_vals.reshape(-1, 1) if y_vals.ndim == 1 else y_vals
-                
+
                 # Adaptive batch refine: try larger batches first, degrade on OOM
                 refined_candidates = []
                 # Dynamic batch sizes: try 20 first, then degrade to 10, 5, 1
                 batch_sizes = [20, 10, 5, 1]
                 current_batch_idx = 0
-                
+
                 batch_start = 0
                 while batch_start < len(candidates) and len(refined_candidates) < 10:
                     batch_size = batch_sizes[current_batch_idx]
                     batch_end = min(batch_start + batch_size, len(candidates))
                     batch_candidates = candidates[batch_start:batch_end]
-                    
+
                     try:
                         batch_refined = refine(
                             env=env_fex,
@@ -373,19 +548,19 @@ def test_modsr(model, env, params, test_cases=None, num_samples=50, top_k=20, se
                             candidates=batch_candidates,
                             verbose=False
                         )
-                        
+
                         if isinstance(batch_refined, list):
                             for res in batch_refined:
                                 if isinstance(res, dict) and 'predicted_tree' in res:
                                     refined_candidates.append(res)
-                        
+
                         # Success! Move to next batch with current batch size
                         batch_start = batch_end
-                        
+
                         # Clean up after successful batch
                         if hasattr(torch, 'npu') and 'npu' in str(device):
                             torch.npu.empty_cache()
-                            
+
                     except RuntimeError as e:
                         if 'out of memory' in str(e).lower() or '507015' in str(e):
                             # OOM error, degrade to smaller batch size
@@ -409,13 +584,13 @@ def test_modsr(model, env, params, test_cases=None, num_samples=50, top_k=20, se
                 if len(refined_candidates) > 0:
                     best_candidate = refined_candidates[0]
                     best_tree = best_candidate.get('predicted_tree')
-                    
+
                     if best_tree is None:
                         print("Best tree is None")
                         continue
 
                     print(f"Pred (refined): {best_tree}")
-                    
+
                     numexpr_fn = env_fex.simplifier.tree_to_numexpr_fn(best_tree)
                     y_pred = numexpr_fn(x_grid)
                     # Handle both 1D and 2D output
@@ -428,20 +603,26 @@ def test_modsr(model, env, params, test_cases=None, num_samples=50, top_k=20, se
                         y_pred = np.full_like(y_vals, y_pred.item())
                     else:
                         raise ValueError(f"Unexpected y_pred shape: {y_pred.shape}")
-                    
+
                     # Ensure both are numpy arrays (not PyTorch tensors)
                     y_vals_np = np.asarray(y_vals)
                     y_pred_np = np.asarray(y_pred)
-                    
+
                     metrics = compute_metrics(
                         {"true": [y_vals_np], "predicted": [y_pred_np], "predicted_tree": [best_tree]},
                         metrics="r2"
                     )
-                    r2 = metrics['r2'][0]
-                    if r2 < 0:
-                        r2 = 0
+                    r2 = float(metrics['r2'][0])
+                    if r2 != r2 or r2 < 0:
+                        r2 = 0.0
                     print(f"R2: {r2}")
                     results.append(r2)
+                    collected_results.append({
+                        'name': name,
+                        'gt_expr': gt_expr,
+                        'pred_expr': str(best_tree),
+                        'r2': r2,
+                    })
                 else:
                     print("Refinement failed to produce candidates.")
 
@@ -456,28 +637,28 @@ def test_modsr(model, env, params, test_cases=None, num_samples=50, top_k=20, se
     r2_099 = sum(1 for r in valid_results if r > 0.99)
     r2_mean = float(np.mean(valid_results)) if valid_results else float('nan')
     print(f"\nSummary: R2>0.99: {r2_099}/{len(valid_results)}, R2 mean: {r2_mean:.6f}")
-    
-    if return_results:
-        return results
+
+    return collected_results
 
 def main():
     parser = get_parser()
     parser.add_argument('--encoder_type', type=str, default='e2e', choices=['e2e', 'snip'])
     parser.add_argument('--e2e_checkpoint', type=str, default='./weights/e2e.pt')
     parser.add_argument('--snip_checkpoint', type=str, default='./weights/snip-10dmax.pth')
-    parser.add_argument('--model_path', type=str, default='./best_model.pth', help='Path to trained MODSR model')
+    parser.add_argument('--model_path', type=str, default='./weights/best_model.pth', help='Path to trained MODSR model')
     parser.add_argument('--n_tests', type=int, default=10)
     parser.add_argument('--traditional_bench', action='store_true', help='Use traditional benchmark tests from file')
     parser.add_argument('--benchmark_path', type=str, default='./assets/benchmarks.csv', help='Path to benchmark csv (optional)')
-    
+    parser.add_argument('--output_csv', type=str, default='./results/inference_results_fex.csv', help='Path to save results CSV')
+
     # FEX Head Arguments
-    parser.add_argument('--fex_head_checkpoint', type=str, default='./best_fex_head.pth', help='Path to FEX Head checkpoint')
+    parser.add_argument('--fex_head_checkpoint', type=str, default='./weights/best_fex_head.pth', help='Path to FEX Head checkpoint')
     parser.add_argument("--use_gradient_guidance", type=str, default="false", help="Enable gradient guidance during sampling")
-    
+
     # length
     parser.add_argument("--guidance_length_window", type=int, default=50, help="Random window size for length guidance (0 = full sequence).")
     parser.add_argument("--guidance_length_min_active", type=int, default=4, help="Minimum active nodes required inside the length window.")
-        
+
     # mse
     parser.add_argument("--guidance_scale", type=float, default=1000.0, help="Scale of the gradient guidance (no sigma_t damping now)")
     parser.add_argument("--guidance_temperature", type=float, default=2.0, help="Temperature for Softmax in guidance")
@@ -494,7 +675,7 @@ def main():
     parser.add_argument("--guidance_normalize_grad", type=str, default="true", help="Normalize guidance gradient to unit norm before applying.")
     parser.add_argument("--guidance_inner_steps", type=int, default=10, help="Number of inner guidance optimization steps per diffusion timestep (used by both autograd and bfgs).")
     parser.add_argument("--guidance_inner_lr", type=float, default=1.0, help="Step size used during inner guidance optimization.")
-    parser.add_argument("--guidance_inner_optimizer", type=str, default="autograd", choices=["autograd", "bfgs"], help="Inner guidance optimizer backend.")
+    parser.add_argument("--guidance_inner_optimizer", type=str, default="bfgs", choices=["autograd", "bfgs"], help="Inner guidance optimizer backend.")
     # scheduler
     parser.add_argument("--guidance_t_min", type=float, default=0.3, help="Minimum normalized timestep for guidance (late stage cutoff).")
     parser.add_argument("--guidance_t_max", type=float, default=0.7, help="Maximum normalized timestep for guidance (early stage cutoff).")
@@ -509,61 +690,30 @@ def main():
     parser.add_argument("--use_perturb_optimization", type=str, default="false", help="Enable perturb-style perturbation-reconstruction optimization.")
     parser.add_argument("--perturb_rewrite_steps", type=int, default=3, help="Number of perturb rewrite iterations.")
     parser.add_argument("--perturb_rewrite_ratio", type=float, default=0.25, help="Perturbation ratio α for perturb (0.0-1.0) controlling structure disruption.")
-    
-    # Panczyk-KAN benchmark datasets (exclude 12D and 13D: rea, fp)
-    parser.add_argument("--panczyk_dataset", type=str, default=None, 
-                       choices=['bwr', 'chf', 'htgr', 'mitr', 'xs', 'heat'],
-                       help="Use Panczyk-KAN nuclear engineering benchmark dataset. If set, overrides --traditional_bench and test case generation.")
-    parser.add_argument("--panczyk_n_points", type=int, default=200, help="Number of points to sample from each Panczyk-KAN dataset (default 200, like traditional benchmark).")
-    parser.add_argument("--panczyk_all", action='store_true', help="Run on all Panczyk-KAN datasets and print summary.")
-
 
     params = parser.parse_args()
-    
+
     # Parse boolean string content
     params.use_gradient_guidance = str(params.use_gradient_guidance).lower() == 'true'
     params.guidance_pow_top1_only = str(params.guidance_pow_top1_only).lower() == 'true'
     params.use_perturb_optimization = str(params.use_perturb_optimization).lower() == 'true'
     params.guidance_normalize_grad = str(params.guidance_normalize_grad).lower() == 'true'
-    if params.guidance_inner_steps <= 0:
-        params.guidance_inner_steps = 1
-    if params.guidance_inner_lr <= 0:
-        params.guidance_inner_lr = 1.0
-    if params.guidance_num_points <= 0:
-        params.guidance_num_points = None
-    if hasattr(params, "guidance_objective"):
-        params.guidance_objective = params.guidance_objective.lower()
-    else:
-        params.guidance_objective = "mse"
     if params.guidance_length_window <= 0:
         params.guidance_length_window = None
-    if params.guidance_length_min_active <= 0:
-        params.guidance_length_min_active = 1
-    if params.guidance_subtree_depth is not None and params.guidance_subtree_depth <= 0:
+    if params.guidance_subtree_depth <= 0:
         params.guidance_subtree_depth = None
-    if params.guidance_grad_clip is not None and params.guidance_grad_clip <= 0:
+    if params.guidance_grad_clip <= 0:
         params.guidance_grad_clip = None
-    if not params.guidance_video_dir:
-        params.guidance_video_dir = None
-    if params.guidance_video_fps <= 0:
-        params.guidance_video_fps = 2
-    if params.guidance_video_topk <= 0:
-        params.guidance_video_topk = 3
-    if params.guidance_video_width_scale <= 0:
-        params.guidance_video_width_scale = 1.8
-    if params.guidance_video_eval_points <= 0:
-        params.guidance_video_eval_points = 5
 
     # Set random seeds for reproducibility
-    seed = 12345
-    torch.manual_seed(seed)
+    torch.manual_seed(params.seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
+        torch.cuda.manual_seed_all(params.seed)
+    np.random.seed(params.seed)
     import random
-    random.seed(seed)
-    
-    
+    random.seed(params.seed)
+
+
     if torch.cuda.is_available() and not params.cpu:
         params.device = 'cuda'
     elif hasattr(torch, 'npu') and torch.npu.is_available() and not params.cpu:
@@ -577,10 +727,10 @@ def main():
     # Defaults needed for environment
     if not hasattr(params, 'batch_size_eval') or params.batch_size_eval is None: params.batch_size_eval = 1
     if not hasattr(params, 'eval_size') or params.eval_size is None: params.eval_size = 100
-    
+
     # Standard env creation
     env = build_env(params)
-    
+
     # Setup FEX environment if checkpoint provided
     env_fex = None
     fex_encoder = None
@@ -592,7 +742,7 @@ def main():
         env_fex = build_env(params_fex)
         fex_encoder = FixedTreeEncoder(depth=params.fex_tree_depth, env=env_fex)
         logger.info("FEX Environment ready.")
-    
+
     # Load model
     logger.info("Creating MODSR model...")
     model = MODSRModel(
@@ -608,7 +758,7 @@ def main():
     model.guidance_t_max = params.guidance_t_max
     model.guidance_max_steps = params.guidance_max_steps
     model.guidance_use_metasymnet_penalty = params.guidance_use_metasymnet_penalty
-    
+
     # Load trained weights
     logger.info(f"Loading trained model from {params.model_path}")
     checkpoint = torch.load(params.model_path, map_location=params.device, weights_only=False)
@@ -621,19 +771,19 @@ def main():
         gen_sd = checkpoint['generator_state_dict']
     elif 'decoder_state_dict' in checkpoint: # some old format
         gen_sd = checkpoint['decoder_state_dict']
-    
+
     # Try to find embedding weights in gen_sd
     if gen_sd is not None:
          if "token_embedding.weight" in gen_sd:
             emb_weight = gen_sd["token_embedding.weight"]
          elif "module.token_embedding.weight" in gen_sd:
             emb_weight = gen_sd["module.token_embedding.weight"]
-    
+
     # If not found in generator part, try root level if checkpoint is flat
     if emb_weight is None and isinstance(checkpoint, dict):
         if "generator.token_embedding.weight" in checkpoint:
             emb_weight = checkpoint["generator.token_embedding.weight"]
-    
+
     if emb_weight is not None:
          ckpt_vocab_size = emb_weight.shape[0]
          model_vocab_size = model.generator.token_embedding.num_embeddings
@@ -650,7 +800,7 @@ def main():
     if model.generator.token_embedding.padding_idx is not None:
         logger.info("Removing padding_idx from token_embedding to match train_fex_head_2 behavior.")
         model.generator.token_embedding.padding_idx = -1
-    
+
     if 'generator_state_dict' in checkpoint:
         gen_sd = checkpoint['generator_state_dict']
         # Handle missing buffers from older checkpoints (constraints logic)
@@ -658,7 +808,7 @@ def main():
         for key in ["position_type_ids", "type_allowed_mask"]:
             if key in model_sd and key not in gen_sd:
                 gen_sd[key] = model_sd[key]
-        
+
         model.generator.load_state_dict(gen_sd)
         logger.info("Loaded generator_state_dict")
     elif 'decoder_state_dict' in checkpoint:
@@ -682,28 +832,50 @@ def main():
                 raise ValueError("Failed to load model state dict. Please check the checkpoint and model configuration.")
 
     model = model.to(params.device)
-    
-    # Load Panczyk-KAN benchmark if specified
-    if params.panczyk_all or params.panczyk_dataset:
-        from tools.panczyk_kan_adapter import load_panczyk_kan_benchmark
-        
-        if params.panczyk_all:
-            # Load all datasets
-            datasets = ['bwr', 'chf', 'htgr', 'mitr', 'xs', 'heat']
-        else:
-            # Load single dataset
-            datasets = [params.panczyk_dataset]
-            
-        logger.info(f"Loading Panczyk-KAN datasets: {datasets} (n_points={params.panczyk_n_points})")
-        test_cases = load_panczyk_kan_benchmark(datasets=datasets, n_points=params.panczyk_n_points, seed=seed)
-        logger.info(f"Loaded {len(test_cases)} datasets from Panczyk-KAN")
-        
+
+    if params.traditional_bench and params.benchmark_path:
+        test_cases = load_benchmark_test_cases(params.benchmark_path, env)
+        logger.info(f"Loaded {len(test_cases)} benchmarks.")
     elif params.traditional_bench and params.benchmark_path:
         test_cases = load_benchmark_test_cases(params.benchmark_path, env)
         logger.info(f"Loaded {len(test_cases)} benchmarks.")
     else:
         test_cases = None
-        
-    test_modsr(model, env, params, test_cases=test_cases, num_samples=params.n_tests, fex_encoder=fex_encoder, env_fex=env_fex)
+
+    collected = test_modsr(model, env, params, test_cases=test_cases, num_samples=params.n_tests, fex_encoder=fex_encoder, env_fex=env_fex)
+
+    if not collected:
+        logger.warning("No results collected, skipping complexity analysis and CSV output.")
+        return
+
+    # --- Compute complexity for each result ---
+    logger.info("Computing expression complexities...")
+    for row in collected:
+        expr_str = row['pred_expr']
+        _, simplified_str, comp = complexity_of(expr_str)
+        row['complexity'] = comp
+        row['simplified'] = simplified_str
+
+    # --- Write CSV ---
+    fieldnames = ['name', 'gt_expr', 'pred_expr', 'r2', 'complexity', 'simplified']
+    os.makedirs(os.path.dirname(params.output_csv) or '.', exist_ok=True)
+    with open(params.output_csv, 'w', newline='') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in collected:
+            writer.writerow(row)
+    logger.info(f"Results written to {params.output_csv} ({len(collected)} rows)")
+
+    # --- Compute and print benchmark group statistics ---
+    logger.info("\n" + "=" * 60)
+    logger.info("Benchmark Group Statistics")
+    logger.info("=" * 60)
+    stats = compute_benchmark_stats(collected)
+    for group_name, s in stats.items():
+        logger.info(
+            f"{group_name}: R² Mean = {s['avg_r2']:.4f}, "
+            f"Complexity Mean = {s['avg_complexity']:.2f}, "
+            f"R²>0.999 = {s.get('pct_above_999', 0):.2f}%"
+        )
 if __name__ == "__main__":
     main()

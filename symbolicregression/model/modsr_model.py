@@ -13,7 +13,7 @@ from .guidance_runner import GuidanceRunner
 from symbolicregression.envs.fixed_tree_encoder import NODE_BINARY, NODE_UNARY, NODE_LEAF
 from symbolicregression.visualization.guidance_video import GuidanceSubtreeVideoRecorder
 from .snip_autoencoder import SNIPLatentAutoencoder, safe_torch_load as safe_torch_load_snip_ae
-from symbolicregression.utils import remove_module_prefix_dict
+from symbolicregression.utils import remove_module_prefix_dict, safe_torch_load
 
 logger = getLogger()
 
@@ -1110,14 +1110,7 @@ class MODSRModel(nn.Module):
                 num_layers=num_layers,
                 max_src_len=self.generator.max_seq_len,
             ).to(self.device)
-            try:
-                ckpt = torch.load(fex_head_checkpoint, map_location=self.device, weights_only=False)
-            except TypeError:
-                ckpt = torch.load(fex_head_checkpoint, map_location=self.device)
-            except ModuleNotFoundError as err:
-                if "torch_npu" not in str(err):
-                    raise
-                ckpt = torch.load(fex_head_checkpoint, map_location=self.device, weights_only=False)
+            ckpt = safe_torch_load(fex_head_checkpoint, map_location='cpu')
             head_state = (
                 ckpt.get("model_state_dict")
                 or ckpt.get("state_dict")

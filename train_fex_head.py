@@ -547,8 +547,6 @@ def train(params):
     fex_vocab_size = env_fex.n_words # Also use n_words for consistency
     tgt_seq_len = 1023 # Fixed for depth 8
     tgt_seq_len_detected = fex_encoder.tree.sequence_length + 2 # + BOS/EOS
-    # Round up to next power of 2 or keep precise? FEX is fixed. 
-    # Actually FEX tree is NOT full binary, it's sparser? No, the template is fixed full.
     tgt_seq_len = tgt_seq_len_detected
     logger.info(f"Detected Target Seq Len from FEX: {tgt_seq_len}")
 
@@ -584,8 +582,6 @@ def train(params):
         except Exception as e:
              logger.warning(f"Failed to load positional embeddings: {e}")
              
-    # Freeze Positional Embeddings to match Frozen Token Embeddings?
-    # Yes, if we consider them part of the "Fixed MODSR View".
     fex_head.src_pos_embed.requires_grad_(False)
     logger.info("Frozen Source Positional Embeddings.")
     
@@ -594,9 +590,6 @@ def train(params):
     pad_id_fex = env_fex.equation_word2id.get("<PAD>", 0) # For Target
     
     # 4. Data Loader
-    # Pass BOTH envs
-    # Use params.max_epoch_size instead of params.epoch_size
-    # Prepare debug path for encode logging
     debug_path = None
     try:
         debug_path = os.path.join(params.dump_path, "fex_encode_debug.txt")
@@ -840,12 +833,7 @@ if __name__ == '__main__':
     from parsers import get_parser
     parser = get_parser()
     
-    # Add script-specific arguments
-    # Note: Some args might duplicate parsers.py, need to be careful or handle conflict
-    parser.add_argument("--modsr_checkpoint", type=str, default="./best_model.pth", help="Path to frozen MODSR checkpoint")
-    # Use max_epoch_size if user prefers, or fallback to n_steps_per_epoch pattern from parsers.py? 
-    # User said "I have max_epoch_size this parameter, unify use this". 
-    # It might be in their local run/script context but not parsers.py. We add it here.
+    parser.add_argument("--modsr_checkpoint", type=str, default="./weights/best_model.pth", help="Path to frozen MODSR checkpoint")
     parser.add_argument("--max_epoch_size", type=int, default=10000, help="Number of samples per epoch")
     parser.add_argument("--debug_log_every", type=int, default=1000, help="Debug log frequency")
     parser.add_argument("--eval_mode", action="store_true", help="Run evaluation mode to convert tokens via the FEX head")

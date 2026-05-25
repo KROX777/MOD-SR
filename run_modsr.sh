@@ -75,7 +75,7 @@ python infer_modsr.py --traditional_bench
 # Inference Pipeline 2: DFEX
 # 1. Train DFEXHead
 setsid torchrun --nproc_per_node=8 train_fex_head.py \
-    --modsr_checkpoint ./best_model.pth \
+    --modsr_checkpoint ./weights/best_model.pth \
     --dump_path ./dump_fex_head_8 \
     --batch_size 16 \
     --max_epoch 80 \
@@ -87,14 +87,14 @@ setsid torchrun --nproc_per_node=8 train_fex_head.py \
     > fex_head_d8.log 2>&1 &
 
 # 2. Inference w/o or w/ GG
-python infer_modsr_fex.py --traditional_bench
+setsid python infer_modsr.py --traditional_bench > fex_infer.log 2>&1 &
 
-python infer_modsr_fex.py --traditional_bench \
+setsid python infer_modsr_fex.py --traditional_bench \
     --use_gradient_guidance True \
     --benchmark_path ./assets/benchmarks.csv \
     --guidance_scale 1000.0 \
     --guidance_inner_optimizer bfgs \
     --guidance_inner_steps 10 \
     --guidance_subtree_depth 8 \
-    --fex_head_checkpoint ./best_fex_head.pth \
-    --fex_tree_depth 8
+    --fex_tree_depth 8 \
+    > fex_infer_gg.log 2>&1 &

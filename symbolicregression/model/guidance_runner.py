@@ -634,28 +634,49 @@ class GuidanceRunner:
                 grad_time = 0.0
                 executor_profile = None
                 max_guidance_batch = min(int(work_topk_active.size(0)), m.guidance_max_batch)
+                batched_X = []
+                batched_Y = []
+                max_points = m.guidance_num_points
+                target_points = None
+                target_dim = None
                 for k in range(max_guidance_batch):
                     data_idx = min(k, len(x_series) - 1)
                     X_data = x_series[data_idx]
                     Y_data = y_series[data_idx]
-                    max_points = m.guidance_num_points
                     if max_points is not None and X_data.shape[0] > max_points:
                         X_data = X_data[:max_points]
                         Y_data = Y_data[:max_points]
-                    start_time = time.perf_counter()
-                    y_pred_relaxed = fex_env.fex_encoder._inner_loop_executor.compute_relaxed_expression(
-                        topk_probs[k],
-                        topk_indices[k],
-                        X_data,
-                        active_positions=active_positions,
-                        frozen_positions=frozen_positions,
-                    )
-                    if executor_profile is None:
-                        executor_profile = dict(fex_env.fex_encoder._inner_loop_executor._last_profile or {})
-                    compute_time += time.perf_counter() - start_time
-                    sample_mse = torch.mean((y_pred_relaxed - Y_data) ** 2)
-                    total_mse = total_mse + sample_mse
-                    valid += 1
+                    Y_data = Y_data.reshape(-1)
+                    if target_points is None:
+                        target_points = int(X_data.shape[0])
+                        target_dim = int(X_data.shape[1]) if X_data.dim() > 1 else 1
+                    cur_dim = int(X_data.shape[1]) if X_data.dim() > 1 else 1
+                    if int(X_data.shape[0]) != target_points or cur_dim != target_dim:
+                        raise RuntimeError(
+                            "BFGS batched guidance requires all X/Y samples to share the same shape. "
+                            f"Expected points={target_points}, dim={target_dim}, got points={int(X_data.shape[0])}, dim={cur_dim} at batch index {k}."
+                        )
+                    batched_X.append(X_data)
+                    batched_Y.append(Y_data)
+
+                start_time = time.perf_counter()
+                if max_guidance_batch <= 0:
+                    return 1e12, None, {}
+                X_batch = torch.stack(batched_X, dim=0)
+                Y_batch = torch.stack(batched_Y, dim=0)
+                y_pred_relaxed = fex_env.fex_encoder._inner_loop_executor.compute_relaxed_expression_batch(
+                    topk_probs[:max_guidance_batch],
+                    topk_indices[:max_guidance_batch],
+                    X_batch,
+                    active_positions=active_positions,
+                    frozen_positions=frozen_positions,
+                    force_cpu=True,
+                ).to(device=device, dtype=Y_batch.dtype)
+                executor_profile = dict(fex_env.fex_encoder._inner_loop_executor._last_profile or {})
+                compute_time += time.perf_counter() - start_time
+                sample_mse = torch.mean((y_pred_relaxed - Y_batch) ** 2, dim=1)
+                total_mse = total_mse + sample_mse.sum()
+                valid += int(sample_mse.numel())
 
                 if valid == 0:
                     return 1e12, None, {}

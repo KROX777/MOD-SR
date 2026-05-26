@@ -1765,10 +1765,7 @@ class MODSRModel(nn.Module):
         x_t_perturbed=None,
         start_timestep=None,
     ):
-        """
-        Internal: single-batch inference sampling (with gradient guidance)
-        Assumes num_samples is small enough to fit in memory.
-        """
+        """Internal: single-batch inference sampling (with gradient guidance)."""
         if self.latent_mode == 'snip_token_latent':
             raise NotImplementedError("sample_with_guidance is not implemented for snip_token_latent mode yet.")
         device = self.device
@@ -1817,10 +1814,8 @@ class MODSRModel(nn.Module):
                 encoder_output = encoder_output.expand(num_samples, -1, -1)
         
         # Initialize x_t (token channel)
-        # Note: We will enable gradients for x_t inside the loop if needed,
-        # or here if we want to trace back to init (usually not needed for T2T).
         if x_t_perturbed is not None and start_timestep is not None:
-            # T2T mode: start from the perturbed state
+            # Perturb mode: start from the perturbed state
             x_t_token = x_t_perturbed
         else:
             # Standard mode: start from random noise
@@ -1831,13 +1826,15 @@ class MODSRModel(nn.Module):
                 device=device,
             )
 
+        x_t_token_2 = x_t_token.clone()
 
-            
+
+
         # Setup timesteps
         if use_ddim:
             step_ratio = max(1, self.scheduler.num_timesteps // max(1, ddim_steps))
             if start_timestep is not None:
-                # T2T mode: already built in descending order, no need to reverse again
+                # Perturb mode: already built in descending order, no need to reverse again
                 timesteps = list(range(start_timestep, -1, -step_ratio))
                 if timesteps and timesteps[-1] != 0:
                     timesteps.append(0)
@@ -1845,7 +1842,7 @@ class MODSRModel(nn.Module):
                 timesteps = list(range(0, self.scheduler.num_timesteps, step_ratio))[:ddim_steps]
                 timesteps = list(reversed(timesteps))
         else:
-            # T2T DDPM mode: start from the specified timestep
+            # Perturb DDPM mode: start from the specified timestep
             if start_timestep is not None:
                 timesteps = list(reversed(range(start_timestep + 1)))
             else:
@@ -1854,11 +1851,10 @@ class MODSRModel(nn.Module):
             
         # Sampling Loop
         predicted_x0_token = None
-        predicted_x0_coeff = None
 
-        # T2T mode: guidance strength needs to be adjusted
+        # Perturb mode: guidance strength needs to be adjusted
         if x_t_perturbed is not None and start_timestep is not None:
-            logger.info(f"[T2T Mode] Starting reconstruction from timestep {start_timestep} (α={start_timestep/self.scheduler.num_timesteps:.2f})")
+            logger.info(f"[Perturb Mode] Starting reconstruction from timestep {start_timestep} (α={start_timestep/self.scheduler.num_timesteps:.2f})")
 
         # Initialize guidance scheduler
         from .guidance_scheduler import GuidanceScheduler
@@ -1941,41 +1937,61 @@ class MODSRModel(nn.Module):
                     guidance_delta.get("mean"),
                     guidance_delta.get("max"),
                 )
-                
-            # Update step (Standard DDIM/DDPM)
-            # We perform the update inside a no_grad block because the update rule itself 
-            # (transition) doesn't need to be differentiated through, 
-            # unless we are doing 'unroll' optimization (not the case for T2T).
-            # BUT: If we applied guidance, x_t_token would have been modified by gradients.
-            
+
             with torch.no_grad():
                 if use_ddim:
                     if i < len(timesteps) - 1:
                         t_prev = timesteps[i + 1]
                         alpha_t = self.scheduler.alphas_cumprod[t_idx]
                         alpha_t_prev = self.scheduler.alphas_cumprod[t_prev]
-                        
+
                         # Token channel update
                         # Calculate original predicted noise
                         pred_noise_token = (x_t_token - torch.sqrt(alpha_t).view(-1, 1, 1) * predicted_x0_token) / \
                                           torch.sqrt(1 - alpha_t).view(-1, 1, 1)
-                        
+
                         x_t_token = torch.sqrt(alpha_t_prev).view(-1, 1, 1) * predicted_x0_token + \
                                    torch.sqrt(1 - alpha_t_prev).view(-1, 1, 1) * pred_noise_token
-                        
+
                 else:
                     # DDPM update
                     x_t_token = self.scheduler.p_sample(x_t_token, t, predicted_x0_token)
 
+            with torch.no_grad():
+                predicted_x0_2 = self.generator(
+                    x_t_token=x_t_token_2,
+                    t=t,
+                    encoder_output=encoder_output,
+                    encoder_mask=None,
+                    return_embeddings=True,
+                )
+            with torch.no_grad():
+                if use_ddim:
+                    if i < len(timesteps) - 1:
+                        t_prev = timesteps[i + 1]
+                        alpha_t = self.scheduler.alphas_cumprod[t_idx]
+                        alpha_t_prev = self.scheduler.alphas_cumprod[t_prev]
+                        pred_noise_2 = (x_t_token_2 - torch.sqrt(alpha_t).view(-1, 1, 1) * predicted_x0_2) / \
+                                          torch.sqrt(1 - alpha_t).view(-1, 1, 1)
+                        x_t_token_2 = torch.sqrt(alpha_t_prev).view(-1, 1, 1) * predicted_x0_2 + \
+                                         torch.sqrt(1 - alpha_t_prev).view(-1, 1, 1) * pred_noise_2
+                else:
+                    x_t_token_2 = self.scheduler.p_sample(x_t_token_2, t, predicted_x0_2)
+
         # Final outputs (Standard Post-processing)
         with torch.no_grad():
-            logger.info("Using FEX Head for final token prediction (Guided).")
             src_seq = predicted_x0_token
             if src_seq.size(1) > self.fex_head.max_src_len:
                 src_seq = src_seq[:, : self.fex_head.max_src_len, :]
             fex_logits = self.fex_head(src_seq)
             fex_tokens = torch.argmax(fex_logits, dim=-1)
-            return fex_tokens, fex_logits
+
+            src_seq_2 = predicted_x0_2
+            if src_seq_2.size(1) > self.fex_head.max_src_len:
+                src_seq_2 = src_seq_2[:, : self.fex_head.max_src_len, :]
+            fex_logits_2 = self.fex_head(src_seq_2)
+            fex_tokens_2 = torch.argmax(fex_logits_2, dim=-1)
+            return fex_tokens, fex_logits, fex_tokens_2, fex_logits_2
 
     def sample_with_guidance(
         self,
@@ -1994,13 +2010,12 @@ class MODSRModel(nn.Module):
     ):
         """
         Inference sampling (with gradient guidance) - supports automatic batching for large batches
-        
-        When num_samples > 20, automatically split into batches to avoid NPU OOM
+
+        Returns (tokens, logits, tokens_2, logits_2).
         """
-        MAX_BATCH_SIZE = 20  # Maximum samples per batch to prevent OOM
-        
+        MAX_BATCH_SIZE = 20
+
         if num_samples <= MAX_BATCH_SIZE:
-            # Handle small batches directly
             return self._sample_single_batch_with_guidance(
                 samples=samples,
                 num_samples=num_samples,
@@ -2021,8 +2036,10 @@ class MODSRModel(nn.Module):
         
         all_tokens = []
         all_logits = []
-        
-        # For T2T mode, x_t_perturbed needs special handling when splitting
+        all_tokens_2 = []
+        all_logits_2 = []
+
+        # For perturb mode, x_t_perturbed needs special handling when splitting
         if x_t_perturbed is not None:
             # Make sure x_t_perturbed can be split
             if x_t_perturbed.size(0) != num_samples:
@@ -2050,7 +2067,7 @@ class MODSRModel(nn.Module):
                 torch.npu.empty_cache()
             
             # Process the current batch
-            batch_tokens, batch_logits = self._sample_single_batch_with_guidance(
+            batch_result = self._sample_single_batch_with_guidance(
                 samples=batch_samples,
                 num_samples=batch_size,
                 use_ddim=use_ddim,
@@ -2064,19 +2081,24 @@ class MODSRModel(nn.Module):
                 x_t_perturbed=batch_x_t_perturbed,
                 start_timestep=start_timestep,
             )
-            
+
+            batch_tokens, batch_logits, batch_tokens_2, batch_logits_2 = batch_result
             all_tokens.append(batch_tokens)
             all_logits.append(batch_logits)
-            
+            all_tokens_2.append(batch_tokens_2)
+            all_logits_2.append(batch_logits_2)
+
             logger.info(f"[sample_with_guidance] Batch {i+1}/{num_batches} completed")
-        
+
         # Merge results from all batches
         final_tokens = torch.cat(all_tokens, dim=0)
         final_logits = torch.cat(all_logits, dim=0)
-        
+        final_tokens_2 = torch.cat(all_tokens_2, dim=0)
+        final_logits_2 = torch.cat(all_logits_2, dim=0)
+
         logger.info(f"[sample_with_guidance] All {num_batches} batches completed, final shape: {final_tokens.shape}")
-        
-        return final_tokens, final_logits
+
+        return final_tokens, final_logits, final_tokens_2, final_logits_2
 
     def _prepare_fex_guidance_structures(self, fex_env, device):
         if fex_env is None or getattr(fex_env, "fex_encoder", None) is None:

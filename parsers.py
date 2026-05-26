@@ -22,7 +22,7 @@ def get_parser():
     )
 
     parser.add_argument(
-        "--seed", type=int, default=23, help="seed for the experiments Of LSO"
+        "--seed", type=int, default=42, help="seed for everything"
     )
     
     parser.add_argument(

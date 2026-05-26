@@ -110,6 +110,59 @@ class FEXInnerLoopExecutor:
     def _ensure_vocab_lookup_tables(self, device):
         self.cache_manager.get_vocab_lut(device)
 
+    def _build_op_code_lut(self, device):
+        w2id = self.encoder.equation_word2id
+        vocab_size = self.encoder.env.n_words
+        unary = torch.full((vocab_size,), -1, dtype=torch.long, device=device)
+        binary = torch.full((vocab_size,), -1, dtype=torch.long, device=device)
+        unary_restricted = torch.zeros((vocab_size,), dtype=torch.bool, device=device)
+
+        unary_map = {
+            '<ID_Unary>': 0,
+            'sin': 1,
+            'cos': 2,
+            'tan': 3,
+            'exp': 4,
+            'log': 5,
+            'sqrt': 6,
+            'abs': 7,
+            'neg': 8,
+            'inv': 9,
+            'pow2': 10,
+            'pow3': 11,
+        }
+        binary_map = {
+            '<ID_Binary>': 0,
+            'add': 1,
+            'sub': 2,
+            'mul': 3,
+            'div': 4,
+        }
+        restricted_unary = {'pow2', 'pow3', 'inv', 'exp', 'log'}
+
+        for word, idx in w2id.items():
+            if idx >= vocab_size:
+                continue
+            if word in unary_map:
+                unary[idx] = unary_map[word]
+                if word in restricted_unary:
+                    unary_restricted[idx] = True
+            if word in binary_map:
+                binary[idx] = binary_map[word]
+
+        return {
+            "unary": unary,
+            "binary": binary,
+            "unary_restricted": unary_restricted,
+        }
+
+    def _get_op_code_lut(self, device):
+        return self.cache_manager.get_or_create_device_cache(
+            "op_code_lut",
+            device,
+            self._build_op_code_lut,
+        )
+
     @staticmethod
     def _safe_clip(x):
         limit = 1e6
@@ -158,6 +211,71 @@ class FEXInnerLoopExecutor:
             return left / (torch.abs(right) + 1e-6)
         return left + right
 
+    def _apply_unary_codes(self, op_codes, child):
+        out = torch.zeros_like(child)
+        if op_codes.numel() == 0:
+            return out
+
+        for code in torch.unique(op_codes):
+            code_val = int(code.item())
+            if code_val < 0:
+                continue
+            mask = op_codes == code_val
+            if not mask.any():
+                continue
+            child_sel = child[mask]
+            if code_val == 0:
+                out[mask] = child_sel
+            elif code_val == 1:
+                out[mask] = torch.sin(child_sel)
+            elif code_val == 2:
+                out[mask] = torch.cos(child_sel)
+            elif code_val == 3:
+                out[mask] = torch.tan(torch.clamp(child_sel, -10, 10))
+            elif code_val == 4:
+                out[mask] = torch.exp(torch.clamp(child_sel, -10, 10))
+            elif code_val == 5:
+                out[mask] = torch.log(torch.abs(child_sel) + 1e-6)
+            elif code_val == 6:
+                out[mask] = torch.sqrt(torch.abs(child_sel) + 1e-8)
+            elif code_val == 7:
+                out[mask] = torch.abs(child_sel)
+            elif code_val == 8:
+                out[mask] = -child_sel
+            elif code_val == 9:
+                out[mask] = 1.0 / (torch.abs(child_sel) + 1e-6)
+            elif code_val == 10:
+                out[mask] = child_sel ** 2
+            elif code_val == 11:
+                out[mask] = child_sel ** 3
+        return torch.nan_to_num(self._safe_clip(out), nan=0.0, posinf=1e6, neginf=-1e6)
+
+    def _apply_binary_codes(self, op_codes, left, right):
+        out = torch.zeros_like(left)
+        if op_codes.numel() == 0:
+            return out
+
+        for code in torch.unique(op_codes):
+            code_val = int(code.item())
+            if code_val < 0:
+                continue
+            mask = op_codes == code_val
+            if not mask.any():
+                continue
+            left_sel = left[mask]
+            right_sel = right[mask]
+            if code_val == 0:
+                out[mask] = left_sel
+            elif code_val == 1:
+                out[mask] = left_sel + right_sel
+            elif code_val == 2:
+                out[mask] = left_sel - right_sel
+            elif code_val == 3:
+                out[mask] = left_sel * right_sel
+            elif code_val == 4:
+                out[mask] = left_sel / (torch.abs(right_sel) + 1e-6)
+        return torch.nan_to_num(self._safe_clip(out), nan=0.0, posinf=1e6, neginf=-1e6)
+
     def _eval_leaf(self, p1_probs, p1_indices, p2_probs, p2_indices, X, num_vars, vocab_lut=None):
         if vocab_lut is None:
             raise RuntimeError("vocab_lut must be provided to _eval_leaf for efficient evaluation")
@@ -190,6 +308,50 @@ class FEXInnerLoopExecutor:
         var_part = sign_val * var_component
         out = mantissa_prob * const_part + (1.0 - mantissa_prob) * var_part
         return torch.nan_to_num(out, nan=0.0, posinf=1e6, neginf=-1e6)
+
+    def _eval_leaf_batch(self, p1_probs, p1_indices, p2_probs, p2_indices, X, vocab_lut=None):
+        if vocab_lut is None:
+            raise RuntimeError("vocab_lut must be provided to _eval_leaf_batch for efficient evaluation")
+
+        num_candidates, _, num_vars = X.shape
+
+        p1_is_mantissa = vocab_lut['is_mantissa'][p1_indices]
+        p1_mantissa_val = vocab_lut['mantissa_val'][p1_indices]
+        p1_sign_val = vocab_lut['sign_val'][p1_indices]
+
+        mantissa_val = torch.sum(p1_probs * p1_mantissa_val * p1_is_mantissa, dim=1)
+        mantissa_prob = torch.sum(p1_probs * p1_is_mantissa, dim=1)
+        sign_val = torch.sum(p1_probs * p1_sign_val, dim=1)
+
+        p2_is_exp = vocab_lut['is_exponent'][p2_indices]
+        p2_exp_val = vocab_lut['exponent_val'][p2_indices]
+        exponent_val = torch.sum(p2_probs * p2_exp_val * p2_is_exp, dim=1)
+        const_part = mantissa_val * (10.0 ** exponent_val)
+
+        p2_var_idx = vocab_lut['var_idx'][p2_indices]
+        valid = (p2_var_idx >= 0) & (p2_var_idx < num_vars)
+        var_weights = torch.zeros((num_candidates, num_vars), dtype=X.dtype, device=X.device)
+        if valid.any():
+            scatter_idx = torch.where(valid, p2_var_idx, torch.zeros_like(p2_var_idx))
+            var_weights.scatter_add_(1, scatter_idx, p2_probs * valid.to(X.dtype))
+            var_component = torch.einsum("bd,bpd->bp", var_weights, X)
+        else:
+            var_component = torch.zeros((num_candidates, X.size(1)), dtype=X.dtype, device=X.device)
+
+        var_part = sign_val.unsqueeze(-1) * var_component
+        out = mantissa_prob.unsqueeze(-1) * const_part.unsqueeze(-1) + (1.0 - mantissa_prob).unsqueeze(-1) * var_part
+        return torch.nan_to_num(out, nan=0.0, posinf=1e6, neginf=-1e6)
+
+    def _eval_leaf_top1_batch(self, pos1_token_ids, pos2_token_ids, X, vocab_lut=None):
+        ones = torch.ones((pos1_token_ids.size(0), 1), dtype=X.dtype, device=X.device)
+        return self._eval_leaf_batch(
+            ones,
+            pos1_token_ids.unsqueeze(-1),
+            ones,
+            pos2_token_ids.unsqueeze(-1),
+            X,
+            vocab_lut=vocab_lut,
+        )
 
     def _eval_leaf_top1(self, pos1_token_id: int, pos2_token_id: int, X: torch.Tensor):
         id2word = self.encoder.equation_id2word
@@ -424,6 +586,226 @@ class FEXInnerLoopExecutor:
             self.cache_manager.cache_frozen_outputs(
                 cache_key, node_outputs, frozen_positions, plan
             )
+
+        t_end = time.perf_counter()
+        self._last_profile.update({
+            'timing_ms_prepare': (t_prepare - t_all0) * 1000.0,
+            'timing_ms_plan': (t_plan - t_prepare) * 1000.0,
+            'timing_ms_active': (t_active - t_plan) * 1000.0,
+            'timing_ms_leaf': (t_leaf - t_active) * 1000.0,
+            'timing_ms_nodes': (t_nodes - t_leaf) * 1000.0,
+            'timing_ms_total': (t_end - t_all0) * 1000.0,
+            'leaf_eval_count': leaf_eval_count,
+            'unary_node_count': unary_node_count,
+            'binary_node_count': binary_node_count,
+            'frozen_node_count': frozen_node_count,
+            'frozen_fast_leaf_count': frozen_fast_leaf_count,
+            'frozen_fast_internal_count': frozen_fast_internal_count,
+        })
+        return torch.nan_to_num(result, nan=0.0, posinf=1e6, neginf=-1e6)
+
+    def compute_relaxed_expression_batch(
+        self,
+        topk_probs,
+        topk_indices,
+        X,
+        active_positions=None,
+        frozen_positions=None,
+        force_cpu=True,
+    ):
+        t_all0 = time.perf_counter()
+
+        if not torch.is_tensor(topk_probs):
+            topk_probs = torch.as_tensor(topk_probs, dtype=torch.float32)
+        if not torch.is_tensor(topk_indices):
+            topk_indices = torch.as_tensor(topk_indices, dtype=torch.long)
+        if not torch.is_tensor(X):
+            X = torch.as_tensor(X, dtype=topk_probs.dtype)
+
+        device = torch.device("cpu") if force_cpu else topk_probs.device
+        dtype = topk_probs.dtype
+        topk_probs = topk_probs.to(device=device, dtype=dtype)
+        topk_indices = topk_indices.to(device=device, dtype=torch.long)
+        X = X.to(device=device, dtype=dtype)
+
+        if topk_probs.dim() == 2:
+            topk_probs = topk_probs.unsqueeze(0)
+        if topk_indices.dim() == 2:
+            topk_indices = topk_indices.unsqueeze(0)
+        if X.dim() == 2:
+            X = X.unsqueeze(0)
+
+        num_candidates = topk_probs.size(0)
+        if X.size(0) == 1 and num_candidates > 1:
+            X = X.expand(num_candidates, -1, -1)
+        elif X.size(0) != num_candidates:
+            raise RuntimeError("X batch size must match candidate batch size")
+
+        if topk_probs.size(1) == self.encoder.tree.sequence_length:
+            pad_probs = torch.zeros((num_candidates, 1, topk_probs.size(2)), dtype=dtype, device=device)
+            pad_indices = torch.zeros((num_candidates, 1, topk_indices.size(2)), dtype=torch.long, device=device)
+            topk_probs = torch.cat([pad_probs, topk_probs], dim=1)
+            topk_indices = torch.cat([pad_indices, topk_indices], dim=1)
+
+        t_prepare = time.perf_counter()
+
+        num_points = X.shape[1]
+        plan = self.cache_manager.get_relaxed_eval_plan(device)
+        t_plan = time.perf_counter()
+        if plan['token_row_max'] >= topk_probs.size(1):
+            raise RuntimeError('topk sequence length is shorter than required FEX positions')
+
+        nodes = plan['nodes']
+        max_layer = plan['max_layer']
+        nodes_by_layer = plan['nodes_by_layer']
+        leaf_indices = plan['leaf_indices']
+        token_row_idx = plan['token_row_idx']
+
+        node_token_probs = topk_probs[:, token_row_idx, :]
+        node_token_indices = topk_indices[:, token_row_idx, :]
+        top1_row_token_ids = topk_indices[:, :, 0] if topk_indices.size(-1) > 0 else None
+
+        node_outputs: List[Optional[torch.Tensor]] = [None] * len(nodes)
+        vocab_lut = self.cache_manager.get_vocab_lut(device)
+        op_lut = self._get_op_code_lut(device)
+        unary_code_lut = op_lut["unary"]
+        binary_code_lut = op_lut["binary"]
+        unary_restricted_lut = op_lut["unary_restricted"]
+
+        restored_count = 0
+        t_active = time.perf_counter()
+        self._last_profile = {
+            'total_nodes': len(nodes),
+            'leaf_count': len(leaf_indices),
+            'active_positions_count': len(active_positions) if active_positions is not None else 0,
+            'frozen_positions_count': len(frozen_positions) if frozen_positions is not None else 0,
+            'frozen_restored_from_cache': restored_count,
+            'candidate_batch_size': num_candidates,
+            'execution_device': str(device),
+        }
+
+        restrict_pow = getattr(self.encoder, 'restrict_pow_top1', False)
+        leaf_eval_count = 0
+        unary_node_count = 0
+        binary_node_count = 0
+        frozen_node_count = 0
+        frozen_fast_leaf_count = 0
+        frozen_fast_internal_count = 0
+
+        for inorder_idx in leaf_indices:
+            if node_outputs[inorder_idx] is not None:
+                continue
+
+            pos1 = token_row_idx[inorder_idx]
+            pos2 = pos1 + 1
+            if pos2 >= topk_probs.size(1):
+                raise RuntimeError('Leaf second position out of bounds')
+
+            is_frozen = pos1.item() in frozen_positions if frozen_positions else False
+            if not is_frozen:
+                node_outputs[inorder_idx] = self._eval_leaf_batch(
+                    topk_probs[:, pos1, :],
+                    topk_indices[:, pos1, :],
+                    topk_probs[:, pos2, :],
+                    topk_indices[:, pos2, :],
+                    X,
+                    vocab_lut=vocab_lut,
+                )
+            else:
+                frozen_node_count += 1
+                with torch.no_grad():
+                    node_outputs[inorder_idx] = self._eval_leaf_top1_batch(
+                        top1_row_token_ids[:, int(pos1.item())],
+                        top1_row_token_ids[:, int(pos2.item())],
+                        X,
+                        vocab_lut=vocab_lut,
+                    )
+                    frozen_fast_leaf_count += 1
+            leaf_eval_count += 1
+        t_leaf = time.perf_counter()
+
+        t_nodes = t_leaf
+        for layer in range(max_layer - 1, -1, -1):
+            for inorder_idx in nodes_by_layer[layer]:
+                if node_outputs[inorder_idx] is not None:
+                    continue
+
+                node = nodes[inorder_idx]
+                node_type = node['type']
+                p_p = node_token_probs[:, inorder_idx, :]
+                p_i = node_token_indices[:, inorder_idx, :]
+
+                node_pos = int(token_row_idx[inorder_idx].item())
+                is_frozen = node_pos in frozen_positions if frozen_positions else False
+
+                if node_type == 'unary':
+                    unary_node_count += 1
+                    child_idx = self.encoder._get_unary_child_idx(inorder_idx)
+                    child = node_outputs[child_idx]
+                    if child is None:
+                        raise RuntimeError(f'Missing child output for unary node {inorder_idx}')
+
+                    if is_frozen:
+                        frozen_node_count += 1
+                        with torch.no_grad():
+                            op_codes = unary_code_lut[top1_row_token_ids[:, node_pos]]
+                            node_outputs[inorder_idx] = self._apply_unary_codes(op_codes, child)
+                            frozen_fast_internal_count += 1
+                            continue
+
+                    out = torch.zeros((num_candidates, num_points), device=device, dtype=dtype)
+                    remaining_mask = torch.ones((num_candidates,), dtype=torch.bool, device=device)
+                    if restrict_pow:
+                        top1_codes = unary_code_lut[p_i[:, 0]]
+                        restricted_mask = unary_restricted_lut[p_i[:, 0]]
+                        if restricted_mask.any():
+                            restricted_out = self._apply_unary_codes(
+                                top1_codes[restricted_mask],
+                                child[restricted_mask],
+                            )
+                            out[restricted_mask] = p_p[restricted_mask, 0].unsqueeze(-1) * restricted_out
+                            remaining_mask[restricted_mask] = False
+                    if remaining_mask.any():
+                        child_rem = child[remaining_mask]
+                        probs_rem = p_p[remaining_mask]
+                        inds_rem = p_i[remaining_mask]
+                        out_rem = torch.zeros_like(child_rem)
+                        for i in range(inds_rem.size(1)):
+                            op_codes = unary_code_lut[inds_rem[:, i]]
+                            applied = self._apply_unary_codes(op_codes, child_rem)
+                            out_rem = out_rem + probs_rem[:, i].unsqueeze(-1) * applied
+                        out[remaining_mask] = out_rem
+                    node_outputs[inorder_idx] = torch.nan_to_num(self._safe_clip(out), nan=0.0, posinf=1e6, neginf=-1e6)
+
+                elif node_type == 'binary':
+                    binary_node_count += 1
+                    left_idx, right_idx = self.encoder._get_binary_child_indices(inorder_idx)
+                    left = node_outputs[left_idx]
+                    right = node_outputs[right_idx]
+                    if left is None or right is None:
+                        raise RuntimeError(f'Missing child output for binary node {inorder_idx}')
+
+                    if is_frozen:
+                        frozen_node_count += 1
+                        with torch.no_grad():
+                            op_codes = binary_code_lut[top1_row_token_ids[:, node_pos]]
+                            node_outputs[inorder_idx] = self._apply_binary_codes(op_codes, left, right)
+                            frozen_fast_internal_count += 1
+                            continue
+
+                    out = torch.zeros((num_candidates, num_points), device=device, dtype=dtype)
+                    for i in range(p_i.size(1)):
+                        op_codes = binary_code_lut[p_i[:, i]]
+                        applied = self._apply_binary_codes(op_codes, left, right)
+                        out = out + p_p[:, i].unsqueeze(-1) * applied
+                    node_outputs[inorder_idx] = torch.nan_to_num(self._safe_clip(out), nan=0.0, posinf=1e6, neginf=-1e6)
+
+                t_nodes = time.perf_counter()
+
+        root_idx = self.encoder.tree.get_root_inorder_idx()
+        result = node_outputs[root_idx]
+        if result is None:
+            raise RuntimeError('Failed to compute root output in compute_relaxed_expression_batch')
 
         t_end = time.perf_counter()
         self._last_profile.update({

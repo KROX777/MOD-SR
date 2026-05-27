@@ -1,3 +1,4 @@
+import argparse
 import torch
 import logging
 import csv
@@ -451,7 +452,7 @@ def _tokens_to_result(direct_tokens, direct_logits, env_fex, x_grid, y_vals, top
     batch_sizes = [20, 10, 5, 1]
     current_batch_idx = 0
     batch_start = 0
-    while batch_start < len(candidates) and len(refined_candidates) < 10:
+    while batch_start < len(candidates):
         batch_size = batch_sizes[current_batch_idx]
         batch_end = min(batch_start + batch_size, len(candidates))
         batch_candidates = candidates[batch_start:batch_end]
@@ -495,43 +496,50 @@ def _tokens_to_result(direct_tokens, direct_logits, env_fex, x_grid, y_vals, top
         print(f"[{label}] Refinement failed to produce candidates.")
         return None, None
 
-    best_candidate = refined_candidates[0]
-    best_tree = best_candidate.get('predicted_tree')
+    best_result = None
+    best_r2 = -999.0
 
-    if best_tree is None:
-        print(f"[{label}] Best tree is None")
+    for candidate in refined_candidates:
+        tree = candidate.get('predicted_tree')
+        if tree is None:
+            continue
+
+        numexpr_fn = env_fex.simplifier.tree_to_numexpr_fn(tree)
+        y_pred = numexpr_fn(x_grid)
+        if y_pred.ndim == 2:
+            y_pred = y_pred[:, 0]
+        elif y_pred.ndim == 1:
+            pass
+        elif y_pred.ndim == 0:
+            y_pred = np.full_like(y_vals, y_pred.item())
+        else:
+            continue
+
+        y_vals_np = np.asarray(y_vals)
+        y_pred_np = np.asarray(y_pred)
+
+        metrics = compute_metrics(
+            {"true": [y_vals_np], "predicted": [y_pred_np], "predicted_tree": [tree]},
+            metrics="r2"
+        )
+        r2 = float(metrics['r2'][0])
+        if r2 != r2 or r2 < 0:
+            r2 = 0.0
+
+        if r2 > best_r2:
+            best_r2 = r2
+            best_result = {
+                'name': name,
+                'gt_expr': gt_expr,
+                'pred_expr': str(tree),
+                'r2': r2,
+            }
+
+    if best_result is None:
+        print(f"[{label}] All refined trees are None")
         return None, None
 
-    print(f"[{label}] Pred (refined): {best_tree}")
-
-    numexpr_fn = env_fex.simplifier.tree_to_numexpr_fn(best_tree)
-    y_pred = numexpr_fn(x_grid)
-    if y_pred.ndim == 2:
-        y_pred = y_pred[:, 0]
-    elif y_pred.ndim == 1:
-        pass
-    elif y_pred.ndim == 0:
-        y_pred = np.full_like(y_vals, y_pred.item())
-    else:
-        raise ValueError(f"Unexpected y_pred shape: {y_pred.shape}")
-
-    y_vals_np = np.asarray(y_vals)
-    y_pred_np = np.asarray(y_pred)
-
-    metrics = compute_metrics(
-        {"true": [y_vals_np], "predicted": [y_pred_np], "predicted_tree": [best_tree]},
-        metrics="r2"
-    )
-    r2 = float(metrics['r2'][0])
-    if r2 != r2 or r2 < 0:
-        r2 = 0.0
-    print(f"[{label}] R2: {r2}")
-    return {
-        'name': name,
-        'gt_expr': gt_expr,
-        'pred_expr': str(best_tree),
-        'r2': r2,
-    }, r2
+    return best_result, best_r2
 
 
 def test_modsr(model, env, params, test_cases=None, num_samples=50, top_k=20, seed=42, fex_encoder=None, env_fex=None):
@@ -672,7 +680,7 @@ def main():
 
     # FEX Head Arguments
     parser.add_argument('--fex_head_checkpoint', type=str, default='./weights/best_fex_head.pth', help='Path to FEX Head checkpoint')
-    parser.add_argument("--use_gradient_guidance", type=str, default="false", help="Enable gradient guidance during sampling")
+    parser.add_argument("--use_gradient_guidance", action="store_true", help="Enable gradient guidance during sampling")
 
     # length
     parser.add_argument("--guidance_length_window", type=int, default=50, help="Random window size for length guidance (0 = full sequence).")
@@ -681,20 +689,20 @@ def main():
     # mse
     parser.add_argument("--guidance_scale", type=float, default=1000.0, help="Scale of the gradient guidance (no sigma_t damping now)")
     parser.add_argument("--guidance_temperature", type=float, default=2.0, help="Temperature for Softmax in guidance")
-    parser.add_argument("--guidance_use_metasymnet_penalty", type=lambda x: x.lower() in ('true', '1', 'yes'), default=True, help="Use MetaSymNet style sharpness penalty")
+    parser.add_argument("--guidance_use_metasymnet_penalty", action=argparse.BooleanOptionalAction, default=True, help="Use MetaSymNet style sharpness penalty")
     parser.add_argument("--guidance_topk", type=int, default=3, help="Top-K candidates per position during guidance.")
     parser.add_argument("--guidance_max_batch", type=int, default=20, help="Maximum samples per guidance step.")
-    parser.add_argument("--guidance_pow_top1_only", type=str, default="true", help="Allow pow2/pow3 only when top-1 unary token.")
+    parser.add_argument("--guidance_pow_top1_only", action=argparse.BooleanOptionalAction, default=True, help="Allow pow2/pow3 only when top-1 unary token.")
     parser.add_argument("--guidance_num_points", type=int, default=50, help="Use only first N data points for guidance (0 = all).")
     parser.add_argument("--guidance_objective", type=str, default="mse", help="Guidance objective: 'mse' or 'length'.")
     parser.add_argument("--guidance_subtree_depth", type=int, default=6, help="Depth of subtree used during gradient guidance (0 = entire tree).")
     parser.add_argument("--guidance_logit_clip", type=float, default=20.0, help="Clamp value for guidance logits (after subtracting row max).")
     parser.add_argument("--guidance_loss01_weight", type=float, default=0.05, help="Weight for 0-1 regularizer during guidance.")
     parser.add_argument("--guidance_grad_clip", type=float, default=1000.0, help="Gradient clip value for guidance signal.")
-    parser.add_argument("--guidance_normalize_grad", type=str, default="true", help="Normalize guidance gradient to unit norm before applying.")
-    parser.add_argument("--guidance_inner_steps", type=int, default=10, help="Number of inner guidance optimization steps per diffusion timestep (used by both autograd and bfgs).")
-    parser.add_argument("--guidance_inner_lr", type=float, default=1.0, help="Step size used during inner guidance optimization.")
+    parser.add_argument("--guidance_normalize_grad", action=argparse.BooleanOptionalAction, default=True, help="Normalize guidance gradient to unit norm before applying.")
+    parser.add_argument("--guidance_inner_steps", type=int, default=5, help="Number of inner guidance optimization steps per diffusion timestep (used by both autograd and bfgs).")
     parser.add_argument("--guidance_inner_optimizer", type=str, default="bfgs", choices=["autograd", "bfgs"], help="Inner guidance optimizer backend.")
+    parser.add_argument("--guidance_inner_lr", type=float, default=1.0, help="Step size used during inner guidance optimization, not used in BFGS.")
     # scheduler
     parser.add_argument("--guidance_t_min", type=float, default=0.3, help="Minimum normalized timestep for guidance (late stage cutoff).")
     parser.add_argument("--guidance_t_max", type=float, default=0.7, help="Maximum normalized timestep for guidance (early stage cutoff).")
@@ -706,17 +714,13 @@ def main():
     parser.add_argument("--guidance_video_width_scale", type=float, default=1.8, help="Horizontal scale factor to make subtree rendering wider.")
     parser.add_argument("--guidance_video_eval_points", type=int, default=5, help="Number of test points listed in the per-frame value table.")
     # perturb
-    parser.add_argument("--use_perturb_optimization", type=str, default="false", help="Enable perturb-style perturbation-reconstruction optimization.")
+    parser.add_argument("--use_perturb_optimization", action="store_true", help="Enable perturb-style perturbation-reconstruction optimization.")
     parser.add_argument("--perturb_rewrite_steps", type=int, default=3, help="Number of perturb rewrite iterations.")
     parser.add_argument("--perturb_rewrite_ratio", type=float, default=0.25, help="Perturbation ratio α for perturb (0.0-1.0) controlling structure disruption.")
 
     params = parser.parse_args()
 
-    # Parse boolean string content
-    params.use_gradient_guidance = str(params.use_gradient_guidance).lower() == 'true'
-    params.guidance_pow_top1_only = str(params.guidance_pow_top1_only).lower() == 'true'
-    params.use_perturb_optimization = str(params.use_perturb_optimization).lower() == 'true'
-    params.guidance_normalize_grad = str(params.guidance_normalize_grad).lower() == 'true'
+    # Post-processing
     if params.guidance_length_window <= 0:
         params.guidance_length_window = None
     if params.guidance_subtree_depth <= 0:

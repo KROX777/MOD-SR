@@ -253,7 +253,7 @@ python infer_modsr_fex.py \
 | `guidance_loss01_weight` | 0.05 | Sharpness penalty weight |
 | `guidance_grad_clip` | 1000.0 | Gradient clipping value |
 | `guidance_normalize_grad` | True | Whether to normalize gradient |
-| `guidance_inner_steps` | 10 | Inner loop optimization steps |
+| `guidance_inner_steps` | 5 | Inner loop optimization steps |
 | `guidance_inner_lr` | 1.0 | Inner loop learning rate |
 | `guidance_inner_optimizer` | "bfgs" | Inner loop optimizer: "autograd" or "bfgs" |
 | `guidance_t_min` | 0.3 | Minimum valid timestep (normalized) |

@@ -189,7 +189,6 @@ class GuidanceRunner:
         profile=False,
         fixed_topk_indices=None,
     ):
-        raise NotImplementedError("This method is not implemented yet. It will be refactored in the future.")
         m = self.model
 
         debug_info = {"objective": objective}
@@ -252,6 +251,9 @@ class GuidanceRunner:
                 if length_debug is None:
                     length_debug = {}
                 return length_signal, active_positions, active_mask_tensor, subtree_root, dict(length_debug or {})
+            
+            else:
+                raise NotImplementedError(f"Unsupported guidance objective: {objective} for autograd")
 
             NEG_INF = -1e9
 
@@ -443,7 +445,7 @@ class GuidanceRunner:
                     debug_info["loss01"] = loss01.item()
                     debug_info["loss_total"] = guidance_loss.item()
                 if profile:
-                    print(
+                    logger.info(
                         f"[GuidanceProfile] t={t_idx} status=ok "
                         f"prep={debug_info.get('prep_time', 0.0)*1000:.2f}ms "
                         f"subtree={debug_info.get('subtree_select_time', 0.0)*1000:.2f}ms "
@@ -483,7 +485,7 @@ class GuidanceRunner:
                 )
             return torch.zeros_like(raw_grad), active_positions, active_mask_tensor, subtree_root, frame_meta
         except Exception as e:
-            print(f"[Guidance] Warning: calculation failed: {e}")
+            logger.info(f"[Guidance] Warning: calculation failed: {e}")
             import traceback
             traceback.print_exc()
             return None, active_positions, active_mask_tensor, subtree_root, None
@@ -555,8 +557,6 @@ class GuidanceRunner:
         optimizer_backend = str(m.guidance_inner_optimizer or "autograd").lower()
         if optimizer_backend not in ("autograd", "bfgs"):
             raise ValueError(f"Unsupported guidance_inner_optimizer: {optimizer_backend}")
-        if recorder is not None and optimizer_backend == "autograd":
-            recorder.begin(objective=objective, t_idx=t_idx)
 
         if optimizer_backend == "bfgs":
             executor = fex_env.fex_encoder._inner_loop_executor
@@ -778,7 +778,7 @@ class GuidanceRunner:
                 if parts:
                     executor_breakdown = " executor[" + ",".join(parts) + "]"
 
-            print(
+            logger.info(
                 f"[Guidance][BFGS] t={t_idx} total_time_ms={total_bfgs_ms:.3f} nit={nit} nfev={nfev} "
                 f"agg_ms(topk={topk_ms:.2f},relaxed={relaxed_ms:.2f},grad={grad_ms:.2f},executor={executor_ms:.2f}) "
                 f"{executor_breakdown}"
@@ -813,6 +813,34 @@ class GuidanceRunner:
             )
 
         elif optimizer_backend == "autograd":
+            if objective == "length":
+                if inner_steps != 1:
+                    logger.warning("Length guidance with autograd only supports inner_steps=1 for now. Ignoring extra steps.")
+                grad, _, _, _, _ = self._guidance_single_pass_autograd(
+                    predicted_x0_token,
+                    fex_env,
+                    x_series,
+                    y_series,
+                    t_idx,
+                    schedule_weight,
+                    guidance_temperature,
+                    objective=objective,
+                    length_window=length_window,
+                    length_min_active=length_min_active,
+                    verbose=verbose,
+                    normalize_override=None,
+                    active_positions=active_positions,
+                    subtree_root=subtree_root,
+                    precomputed_fex_logits=initial_fex_logits,
+                    optimize_on_fex_logits=False,
+                    profile=m.guidance_profile,
+                    fixed_topk_indices=None,
+                )
+                return grad
+            
+            if recorder is not None:
+                recorder.begin(objective=objective, t_idx=t_idx)
+            
             for step in range(inner_steps):
                 inner_start = time.perf_counter()
                 work_fex = working_fex_logits.detach().clone().requires_grad_(True)
@@ -885,8 +913,8 @@ class GuidanceRunner:
                     fex_logits_override=working_fex_logits,
                 )
 
-        if recorder is not None and optimizer_backend == "autograd":
-            _ = recorder.finalize()
+            if recorder is not None:
+                _ = recorder.finalize()
         
         if torch.linalg.norm(total_shift_fex) < 1e-6:
             return torch.zeros_like(predicted_x0_token)

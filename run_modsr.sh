@@ -89,12 +89,29 @@ setsid torchrun --nproc_per_node=8 train_fex_head.py \
 # 2. Inference w/o or w/ GG
 setsid python infer_modsr.py --traditional_bench > fex_infer.log 2>&1 &
 
+# Change guidance_subtree_depth to 8 when evaluating on higher-dimensional benchmarks like Feynman
 setsid python infer_modsr_fex.py --traditional_bench \
     --use_gradient_guidance \
     --benchmark_path ./assets/benchmarks.csv \
     --guidance_scale 1000.0 \
     --guidance_inner_optimizer bfgs \
     --guidance_inner_steps 5 \
-    --guidance_subtree_depth 8 \
+    --guidance_subtree_depth 5 \
     --fex_tree_depth 8 \
     > fex_infer_gg.log 2>&1 &
+
+# Length guidance for complexity reduction
+setsid python infer_modsr_fex.py --traditional_bench \
+    --use_gradient_guidance \
+    --guidance_objective length \
+    --guidance_inner_optimizer autograd \
+    --benchmark_path ./assets/benchmarks.csv \
+    --guidance_scale 5000.0 \
+    --guidance_temperature 2.0 \
+    --guidance_inner_steps 1 \
+    --guidance_max_steps 30 \
+    --guidance_subtree_depth 5 \
+    --guidance_t_max 0.9 \
+    --guidance_t_min 0.1 \
+    --fex_tree_depth 8 \
+    > fex_infer_gg_length.log 2>&1 &

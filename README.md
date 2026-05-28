@@ -82,6 +82,12 @@ Please put the two weights in `weights/`.
 
 Please refer to `run_modsr.sh`
 
+We also open-source our trained model:
+- **Embedder & Denoiser Weights:** Get them from [here](https://drive.google.com/file/d/13qTRCm5MpiE_b0gtVVC56A00tpjMrp9q/view?usp=sharing)
+- **DFEXHead:**: Get them from [here](https://drive.google.com/file/d/1zGWKtACQHGU8jGJi2f0pk2v-kfyQA1f8/view?usp=sharing)
+
+Note that since DFEXHead is trained on Huawei Ascend NPU, there might be some issues when loading it on a CUDA device. So we recommend retrain DFEXHead using the embedder & denoiser weights according to `run_modsr.sh`. It's cheap to train.
+
 ## Citation
 ```tex
 @inproceedings{xiang2026modsr,
@@ -97,6 +103,5 @@ Please refer to `run_modsr.sh`
 
 This project is licensed under the MIT License (Copyright 2026 Chuyang Xiang).
 
-Portions of this project are derived from the Facebook Research Symbolic Regression 
-project (https://github.com/facebookresearch/symbolicregression), licensed under 
+Portions of this project are derived from the Facebook Research Symbolic Regression project (https://github.com/facebookresearch/symbolicregression), licensed under 
 Apache License 2.0. See ATTRIBUTION.md for details.
